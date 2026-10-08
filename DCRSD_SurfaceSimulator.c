@@ -46,6 +46,10 @@ private:
     TGTextEntry         *fCfgFile;
     TGCheckButton       *fChkTrench    = nullptr;
     TGCheckButton       *fChkNoStruct = nullptr;
+    TGCheckButton       *fChkGrid    = nullptr;
+    TGCheckButton       *fChkGridX  = nullptr;
+    TGNumberEntry       *fNumGridOffset = nullptr, *fNumGridRend = nullptr;
+    bool                 fGridLocked = false;   // grid mode has disabled trench/no-structure/gap controls
     TGCheckButton       *fChkLandau = nullptr;
     TGLabel             *fLblStripR;
     TGTextButton        *fStatusLabel;
@@ -100,6 +104,10 @@ private:
         TString geomKey;
         if (TrenchEnabled())
             geomKey = TString::Format("PP%.0f_Rsh%.0f_tr1_Rin%.2f_Rpad%.0f", PP(), rsh, rin, rpad);
+        else if (GridEnabled())
+            geomKey = TString::Format("PP%.0f_Rsh%.0f_RsP%.0f_RsM%.0f_%s_tr0_Rin%.2f_Rpad%.0f",
+                PP(), rsh, fNumRStripPad->GetNumber(), fNumRStripMid->GetNumber(),
+                GridKey().Data(), rin, rpad);
         else
             geomKey = TString::Format("PP%.0f_Rsh%.0f_RsP%.0f_RsM%.0f_gap%.1f_gapP%.1f_tr0_Rin%.2f_Rpad%.0f",
                 PP(), rsh, fNumRStripPad->GetNumber(), fNumRStripMid->GetNumber(),
@@ -147,15 +155,18 @@ private:
     TMatrixDSparse *fMatrixStatic = nullptr; 
     double fLastRsheetStat = -1, fLastRStripPStat = -1, fLastRStripMStat = -1, fLastGapStat = -1, fLastGapPadStat = -1, fLastPPStat = -1, fLastRinStat = -1, fLastPadRadiusStat = -1;
     bool   fLastTrenchStat = false;
+    TString fLastGridKeyStat;
 
     TDecompSparse  *fSolverTrans = nullptr;
     TMatrixDSparse *fMatrixTrans = nullptr; 
     double fLastRsheetTrans = -1, fLastRStripPTrans = -1, fLastRStripMTrans = -1, fLastThickTrans = -1, fLastGapTrans = -1, fLastPPTrans = -1, fLastRinTrans = -1;
     bool   fLastTrenchTrans = false;
+    TString fLastGridKeyTrans;
     double fLastDtTrans = -1, fLastCnodeTrans = -1;
 
     std::vector<int> fTypeMap;
     std::vector<int> fPadOwnerMap;
+    TString          fTypeMapGridKey;   // GridKey() the type maps were last built with
 
     TH2D *fTemplates[4] = {};
     bool fTemplatesReady = false;
@@ -249,6 +260,25 @@ public:
         vCol2->AddFrame(fChkNoStruct, new TGLayoutHints(kLHintsLeft | kLHintsTop, 20, 5, 4, 5));
         fChkNoStruct->Connect("Toggled(Bool_t)", "RSDStripPanel", this, "DoNoStructToggle()");
 
+        // Strip grid with offset pads: checkbox + offset axis (unchecked = pads sit on the
+        // y-directed strips, offset in y) on one row, offset / strip-end R on the next
+        TGHorizontalFrame *hGrid = new TGHorizontalFrame(vCol2);
+        fChkGrid = new TGCheckButton(hGrid, "Strip grid, offset pads");
+        hGrid->AddFrame(fChkGrid, new TGLayoutHints(kLHintsLeft | kLHintsCenterY, 0, 15, 0, 0));
+        fChkGrid->Connect("Toggled(Bool_t)", "RSDStripPanel", this, "DoGridToggle()");
+        fChkGridX = new TGCheckButton(hGrid, "offset in x");
+        hGrid->AddFrame(fChkGridX, new TGLayoutHints(kLHintsLeft | kLHintsCenterY));
+        vCol2->AddFrame(hGrid, new TGLayoutHints(kLHintsLeft | kLHintsTop, 20, 5, 4, 5));
+
+        vCol2->AddFrame(new TGLabel(vCol2, "Pad offset [um] / Strip end R to GND [Ohm]:"), lblL);
+        TGHorizontalFrame *hGridN = new TGHorizontalFrame(vCol2);
+        TGLayoutHints *gridL = new TGLayoutHints(kLHintsLeft, 0, 4, 0, 0);
+        fNumGridOffset = new TGNumberEntry(hGridN, 100, 5, -1, TGNumberFormat::kNESRealOne, TGNumberFormat::kNEANonNegative, TGNumberFormat::kNELLimitMinMax, 0, 3000);
+        hGridN->AddFrame(fNumGridOffset, gridL);
+        fNumGridRend = new TGNumberEntry(hGridN, 500, 6, -1, TGNumberFormat::kNESRealOne, TGNumberFormat::kNEAPositive, TGNumberFormat::kNELLimitMinMax, 1, 1e9);
+        hGridN->AddFrame(fNumGridRend, gridL);
+        vCol2->AddFrame(hGridN, entL);
+
         fLblStripR = new TGLabel(vCol2, "Total R_strip: 9999.9 kOhm");
         vCol2->AddFrame(fLblStripR, entL);
 
@@ -270,6 +300,7 @@ public:
 
         fNumRStripPad->Connect("ValueSet(Long_t)", "RSDStripPanel", this, "UpdateStripRLabel()");
         fNumRStripMid->Connect("ValueSet(Long_t)", "RSDStripPanel", this, "UpdateStripRLabel()");
+        UpdateGridControls();
         UpdateStripRLabel();
 
         BoldHead(vCol2, "--- Electronics ---");
@@ -439,6 +470,8 @@ public:
     void BuildTypeMaps(double pp, double pad_r = 60.0) {
         std::fill(fTypeMap.begin(), fTypeMap.end(), 0);
         std::fill(fPadOwnerMap.begin(), fPadOwnerMap.end(), 0);
+        bool grid = GridEnabled();
+        fTypeMapGridKey = GridKey();
         double p = pp / 100.0; // grid pitch
         for (int i = 0; i < n; i++) {
             for (int j = 0; j < n; j++) {
@@ -448,7 +481,8 @@ public:
                 double min_dp = 1e9;
                 int closest_pad = -1;
                 for (int r = 0; r < 4; r++) {
-                    double ds = std::min(std::abs(x - r*pp), std::abs(y - r*pp));
+                    double ds = grid ? std::min(GridLineDist(x, GridShift(0)), GridLineDist(y, GridShift(1)))
+                                     : std::min(std::abs(x - r*pp), std::abs(y - r*pp));
                     if (ds <= pp*0.025) is_s = true;
                     for (int c = 0; c < 4; c++) {
                         double dp = TMath::Hypot(x - r*pp, y - c*pp);
@@ -462,6 +496,88 @@ public:
     }
 
     bool TrenchEnabled() { return fChkTrench && fChkTrench->IsOn(); }
+
+    // Trench takes precedence if both end up checked (e.g. from a loaded config)
+    bool GridEnabled() { return fChkGrid && fChkGrid->IsOn() && !TrenchEnabled(); }
+    // A disabled TGCheckButton reports IsOn()==false; this reads the remembered choice
+    bool GridShiftX() { return fChkGridX->IsOn() || fChkGridX->IsDisabledAndSelected(); }
+
+    // Geometry tag for cache keys; empty when grid mode is off
+    TString GridKey() {
+        if (!GridEnabled()) return "";
+        return TString::Format("grid1_off%.1f_ax%d_Rend%.1f",
+            fNumGridOffset->GetNumber(), GridShiftX() ? 1 : 0, fNumGridRend->GetNumber());
+    }
+
+    // Strip grid with offset pads. Continuous strips of width 0.05*PP run the full
+    // domain in x and y, in the same resistive layer, so they are joined at every
+    // crossing. Each pad sits on one strip, a distance s (pad offset) from the
+    // nearest crossing: pads stay at (r*PP, c*PP) and one strip family is shifted
+    // by -s instead (offset in y: the x-directed strips sit at y = k*PP - s, so each
+    // pad is on its y-directed strip, s above the crossing; offset in x: mirror).
+    // Strips run past the domain edge to ground; that extension is lumped into
+    // R_end from each strip end node to GND. With s = 0 and R_end -> inf this is
+    // the plain straight-strip grid.
+    // GridShift(axis): shift of the strips that are perpendicular to axis
+    // (axis 0: x-positions of the y-directed strips, 1: y-positions of the x-directed ones).
+    double GridShift(int axis) { return (GridShiftX() == (axis == 0)) ? fNumGridOffset->GetNumber() : 0.0; }
+
+    // Distance from coordinate u to the nearest strip line k*PP - shift (any integer k)
+    double GridLineDist(double u, double shift) {
+        double m = std::fmod(u + shift, PP());
+        if (m < 0) m += PP();
+        return std::min(m, PP() - m);
+    }
+
+    // Strip sheet resistance: R_sP at a crossing, R_sM midway between crossings,
+    // as for the straight strips; along = distance to the nearest crossing.
+    double GridStripR(double along) {
+        double R_sP = fNumRStripPad->GetNumber();
+        double R_sM = fNumRStripMid->GetNumber();
+        return R_sP + (R_sM - R_sP) * (2.0 * std::min(along, PP()/2.0) / PP());
+    }
+
+    // Number of strip ends grounded at node (i,j): the centreline node of each strip
+    // where it leaves the domain (2 at a corner where both strip families end).
+    int GridStripEnds(int i, int j) {
+        auto onCentre = [&](int k, double shift) {
+            double u = k * Pitch() + shift;
+            double d = u - std::round(u / PP()) * PP();
+            return d > -0.5*Pitch() && d <= 0.5*Pitch();
+        };
+        int ends = 0;
+        if ((j == 0 || j == n-1) && onCentre(i, GridShift(0))) ends++;   // y-directed strip
+        if ((i == 0 || i == n-1) && onCentre(j, GridShift(1))) ends++;   // x-directed strip
+        return ends;
+    }
+
+    // SetEnabled(kTRUE) on an enabled, checked TGCheckButton un-checks it: only call on change
+    static void SetCheckEnabled(TGCheckButton *b, bool e) { if (b->IsEnabled() != e) b->SetEnabled(e); }
+    // Set a check state even if the box is currently disabled (toggles re-sync afterwards)
+    static void SetCheckState(TGCheckButton *b, bool on) {
+        SetCheckEnabled(b, true);
+        b->SetState(on ? kButtonDown : kButtonUp);
+    }
+
+    // Grid mode is exclusive with trench / no-structure. Like DoNoStructToggle does
+    // for the trench box, exclusion works by disabling the other checkbox (a disabled
+    // TGCheckButton reports IsOn()==false and restores its state when re-enabled).
+    void UpdateGridControls() {
+        if (!fChkGrid) return;
+        bool ns = fChkNoStruct->IsOn();
+        SetCheckEnabled(fChkGrid, !ns && !TrenchEnabled());
+        bool grid = GridEnabled();
+        SetCheckEnabled(fChkGridX, grid);
+        fNumGridOffset->SetState(grid);
+        fNumGridRend->SetState(grid);
+        if (grid) {
+            SetCheckEnabled(fChkTrench, false);
+            SetCheckEnabled(fChkNoStruct, false);
+            fNumStripGap->SetState(false);      // straight-strip gaps don't apply to the grid
+            fNumStripGapPad->SetState(false);
+            fGridLocked = true;
+        }
+    }
 
     // Center node of pad k (1..16): the single representative that drains to GND via R_in
     int PadCenterNode(int pad_k) {
@@ -493,6 +609,7 @@ public:
         fNumRStripMid->SetState(!trench);
         fNumStripGap->SetState(!trench);
         fNumStripGapPad->SetState(!trench);
+        UpdateGridControls();
         UpdateStripRLabel();
     }
 
@@ -508,6 +625,22 @@ public:
         fNumRStripMid->SetState(!disableStrips);
         fNumStripGap->SetState(!disableStrips);
         fNumStripGapPad->SetState(!disableStrips);
+        UpdateGridControls();
+        UpdateStripRLabel();
+    }
+
+    void DoGridToggle() {
+        if (!GridEnabled() && fGridLocked) {
+            // Release what grid mode locked
+            fGridLocked = false;
+            SetCheckEnabled(fChkNoStruct, true);
+            bool ns = fChkNoStruct->IsOn();
+            SetCheckEnabled(fChkTrench, !ns);
+            bool disableStrips = ns || TrenchEnabled();
+            fNumStripGap->SetState(!disableStrips);
+            fNumStripGapPad->SetState(!disableStrips);
+        }
+        UpdateGridControls();
         UpdateStripRLabel();
     }
 
@@ -519,18 +652,23 @@ public:
         double R_sP   = fNumRStripPad->GetNumber();
         double R_sM   = fNumRStripMid->GetNumber();
         double pp          = PP();
-        // Strip width = 2 * (PP*0.025) from GetEdgeConductance threshold
-        double strip_width = 2.0 * 0.025 * pp;   // = 0.05 * pp  (always 20 sq pad-to-pad)
-        double N_sq        = pp / strip_width;    // = 20, independent of PP
-        // Resistance: N_sq/2 squares per half, average resistivity (R_sP+R_sM)/2
-        double R_tot       = (N_sq / 2.0) * (R_sP + R_sM);
+        const char *what = "Total R_strip";
+        double R_tot;
+        if (GridEnabled()) what = "R_strip crossing->crossing";
+        {
+            // Strip width = 2 * (PP*0.025) from GetEdgeConductance threshold
+            double strip_width = 2.0 * 0.025 * pp;   // = 0.05 * pp  (always 20 sq pad-to-pad)
+            double N_sq        = pp / strip_width;    // = 20, independent of PP
+            // Resistance: N_sq/2 squares per half, average resistivity (R_sP+R_sM)/2
+            R_tot              = (N_sq / 2.0) * (R_sP + R_sM);
+        }
         TString txt;
         if (R_tot >= 1e6)
-            txt = TString::Format("Total R_strip: %.2f MOhm", R_tot / 1e6);
+            txt = TString::Format("%s: %.2f MOhm", what, R_tot / 1e6);
         else if (R_tot >= 1e3)
-            txt = TString::Format("Total R_strip: %.1f kOhm", R_tot / 1e3);
+            txt = TString::Format("%s: %.1f kOhm", what, R_tot / 1e3);
         else
-            txt = TString::Format("Total R_strip: %.0f Ohm", R_tot);
+            txt = TString::Format("%s: %.0f Ohm", what, R_tot);
         fLblStripR->SetText(txt.Data());
         fLblStripR->Resize(fLblStripR->GetDefaultWidth(), fLblStripR->GetDefaultHeight());
         ((TGCompositeFrame*)fLblStripR->GetParent())->Layout();
@@ -595,6 +733,16 @@ public:
         // With trench active, strips have no effect (only bulk)
         if (TrenchEnabled()) return 1.0/R_bulk;
 
+        // Strip grid replaces the straight strips. dj==0: x-directed edge, on an
+        // x-directed strip if within 0.025*PP of one (same width as the straight strips)
+        if (GridEnabled()) {
+            double sx = GridShift(0), sy = GridShift(1);
+            double across = (dj == 0) ? GridLineDist(ymid, sy) : GridLineDist(xmid, sx);
+            if (across > PP()*0.025) return 1.0/R_bulk;
+            double along  = (dj == 0) ? GridLineDist(xmid, sx) : GridLineDist(ymid, sy);
+            return 1.0/R_bulk + 1.0/GridStripR(along);
+        }
+
         // dj==0  →  horizontal edge (x-direction): check horizontal strips at y = k*500
         // di==0  →  vertical edge   (y-direction): check vertical   strips at x = k*500
         double gap_half     = fNumStripGap->GetNumber() / 2.0;
@@ -643,6 +791,14 @@ public:
     }
 
     double GetLocalResistance(double x, double y) {
+        if (GridEnabled()) {
+            double dx = GridLineDist(x, GridShift(0)), dy = GridLineDist(y, GridShift(1));
+            const double hw = PP()*0.025;
+            if (dx <= hw && dy <= hw) return GridStripR(std::min(dx, dy));   // crossing
+            if (dy <= hw) return GridStripR(dx);                             // x-directed strip
+            if (dx <= hw) return GridStripR(dy);                             // y-directed strip
+            return fNumRsheet->GetNumber();
+        }
         double R_bulk = fNumRsheet->GetNumber();
         double R_sP = fNumRStripPad->GetNumber();
         double R_sM = fNumRStripMid->GetNumber();
@@ -814,9 +970,10 @@ public:
             bool trench = TrenchEnabled();
             double gap = fNumStripGap->GetNumber(); double gap_pad = fNumStripGapPad->GetNumber(); double pp = PP();
             double pad_r = PadRadius();
-            if (pp != fLastPPStat || pad_r != fLastPadRadiusStat) BuildTypeMaps(pp, pad_r);
+            TString gridKey = GridKey();
+            if (pp != fLastPPStat || pad_r != fLastPadRadiusStat || gridKey != fTypeMapGridKey) BuildTypeMaps(pp, pad_r);
             double rin = fNumRin->GetNumber();
-            if (fSolverStatic && fMatrixStatic && R_sh==fLastRsheetStat && R_sP==fLastRStripPStat && R_sM==fLastRStripMStat && gap==fLastGapStat && gap_pad==fLastGapPadStat && pp==fLastPPStat && trench==fLastTrenchStat && rin==fLastRinStat && pad_r==fLastPadRadiusStat) return fSolverStatic;
+            if (fSolverStatic && fMatrixStatic && R_sh==fLastRsheetStat && R_sP==fLastRStripPStat && R_sM==fLastRStripMStat && gap==fLastGapStat && gap_pad==fLastGapPadStat && pp==fLastPPStat && trench==fLastTrenchStat && rin==fLastRinStat && pad_r==fLastPadRadiusStat && gridKey==fLastGridKeyStat) return fSolverStatic;
             if (fSolverStatic) delete fSolverStatic; if (fMatrixStatic) delete fMatrixStatic;
             fMatrixStatic = nullptr;
             // --- On-disk cache ---
@@ -825,6 +982,8 @@ public:
             TString cacheDir;
             if (trench)
                 cacheDir = TString::Format("rsd_cache/PP%.0f/trench", pp);
+            else if (!gridKey.IsNull())
+                cacheDir = TString::Format("rsd_cache/PP%.0f/grid_RsP%.0f_RsM%.0f", pp, R_sP, R_sM);
             else
                 cacheDir = TString::Format("rsd_cache/PP%.0f/RsP%.0f_RsM%.0f", pp, R_sP, R_sM);
             gSystem->mkdir(cacheDir.Data(), kTRUE);
@@ -833,6 +992,10 @@ public:
                 cacheKey = TString::Format(
                     "PP%.0f_Rsh%.0f_tr1_Rin%.2f_Rpad%.0f",
                     pp, R_sh, rin, pad_r);
+            else if (!gridKey.IsNull())
+                cacheKey = TString::Format(
+                    "PP%.0f_Rsh%.0f_RsP%.0f_RsM%.0f_%s_tr0_Rin%.2f_Rpad%.0f",
+                    pp, R_sh, R_sP, R_sM, gridKey.Data(), rin, pad_r);
             else
                 cacheKey = TString::Format(
                     "PP%.0f_Rsh%.0f_RsP%.0f_RsM%.0f_gap%.1f_gapP%.1f_tr0_Rin%.2f_Rpad%.0f",
@@ -861,17 +1024,20 @@ public:
                 }
             }
             fSolverStatic = new TDecompSparse(); fSolverStatic->SetMatrix(*fMatrixStatic); fSolverStatic->Decompose();
-            fLastRsheetStat = R_sh; fLastRStripPStat = R_sP; fLastRStripMStat = R_sM; fLastGapStat = gap; fLastGapPadStat = gap_pad; fLastPPStat = pp; fLastTrenchStat = trench; fLastRinStat = rin; fLastPadRadiusStat = pad_r;
+            fLastRsheetStat = R_sh; fLastRStripPStat = R_sP; fLastRStripMStat = R_sM; fLastGapStat = gap; fLastGapPadStat = gap_pad; fLastPPStat = pp; fLastTrenchStat = trench; fLastRinStat = rin; fLastPadRadiusStat = pad_r; fLastGridKeyStat = gridKey;
             return fSolverStatic;
         } else {
             bool trench = TrenchEnabled();
             double gap = fNumStripGap->GetNumber(); double pp = PP();
         double rin = fNumRin->GetNumber();
-            if (fSolverTrans && fMatrixTrans && R_sh==fLastRsheetTrans && R_sP==fLastRStripPTrans && R_sM==fLastRStripMTrans && th==fLastThickTrans && gap==fLastGapTrans && pp==fLastPPTrans && dt==fLastDtTrans && C_node==fLastCnodeTrans && trench==fLastTrenchTrans && rin==fLastRinTrans) return fSolverTrans;
+            TString gridKey = GridKey();
+            // CalculatePropagation (transient) reads fPadOwnerMap, which depends on the arms
+            if (gridKey != fTypeMapGridKey) BuildTypeMaps(pp, PadRadius());
+            if (fSolverTrans && fMatrixTrans && R_sh==fLastRsheetTrans && R_sP==fLastRStripPTrans && R_sM==fLastRStripMTrans && th==fLastThickTrans && gap==fLastGapTrans && pp==fLastPPTrans && dt==fLastDtTrans && C_node==fLastCnodeTrans && trench==fLastTrenchTrans && rin==fLastRinTrans && gridKey==fLastGridKeyTrans) return fSolverTrans;
             if (fSolverTrans) delete fSolverTrans; if (fMatrixTrans) delete fMatrixTrans;
             fMatrixTrans = new TMatrixDSparse(nTot, nTot); BuildMatrix(*fMatrixTrans, true, C_node/dt);
             fSolverTrans = new TDecompSparse(); fSolverTrans->SetMatrix(*fMatrixTrans); fSolverTrans->Decompose();
-            fLastRsheetTrans = R_sh; fLastRStripPTrans = R_sP; fLastRStripMTrans = R_sM; fLastThickTrans = th; fLastGapTrans = gap; fLastPPTrans = pp; fLastDtTrans = dt; fLastCnodeTrans = C_node; fLastTrenchTrans = trench; fLastRinTrans = rin;
+            fLastRsheetTrans = R_sh; fLastRStripPTrans = R_sP; fLastRStripMTrans = R_sM; fLastThickTrans = th; fLastGapTrans = gap; fLastPPTrans = pp; fLastDtTrans = dt; fLastCnodeTrans = C_node; fLastTrenchTrans = trench; fLastRinTrans = rin; fLastGridKeyTrans = gridKey;
             return fSolverTrans;
         }
     }
@@ -881,6 +1047,8 @@ public:
         bool use_Rin = (R_in > 0);
         // Short-circuit conductance within metal pad (enforces equipotential)
         const double G_short = 1e6;
+        // Strip grid: strip ends drain to GND through R_end (diagonal only, keeps M symmetric)
+        const double G_end = GridEnabled() ? 1.0/fNumGridRend->GetNumber() : 0.0;
         const int di[] = {1,-1,0,0}, dj[] = {0,0,1,-1};
         for (int i=0; i<n; i++) {
             for (int j=0; j<n; j++) {
@@ -895,6 +1063,7 @@ public:
                     double sum_g = diagAdd;
                     // Only the center node of this pad drains to GND via R_in
                     if (idx == PadCenterNode(pad_k)) sum_g += 1.0/R_in;
+                    if (G_end > 0) sum_g += G_end * GridStripEnds(i, j);
                     for (int k2=0; k2<4; k2++) {
                         int ni=i+di[k2], nj=j+dj[k2];
                         if (ni>=0&&ni<n&&nj>=0&&nj<n) {
@@ -916,6 +1085,7 @@ public:
 
                 // Surface node: regular KCL
                 double sum_g = diagAdd;
+                if (G_end > 0) sum_g += G_end * GridStripEnds(i, j);
                 for (int k2=0; k2<4; k2++) {
                     int ni=i+di[k2], nj=j+dj[k2];
                     if (ni>=0&&ni<n&&nj>=0&&nj<n) {
@@ -1581,6 +1751,12 @@ void DoSharingTemplates() {
         extractGap(gap);
         extract("_gapP", gapp);
     }
+    bool isGrid = !isTrench && fn.find("_grid1") != std::string::npos;
+    double goff = fNumGridOffset->GetNumber(), grend = fNumGridRend->GetNumber(), gax = GridShiftX() ? 1 : 0;
+    if (isGrid && !(extract("_off", goff) && extract("_ax", gax) && extract("_Rend", grend))) {
+        std::cout << "ERROR: cannot parse grid parameters from cache filename: " << fn << std::endl;
+        return;
+    }
 
     fNumPixelPitch->SetNumber((int)pp);
     fNumRsheet->SetNumber(rsh);
@@ -1593,9 +1769,17 @@ void DoSharingTemplates() {
         fNumStripGap->SetNumber(gap);
         fNumStripGapPad->SetNumber(gapp);
     }
+    SetCheckState(fChkGrid, isGrid);
+    if (isGrid) {
+        fNumGridOffset->SetNumber(goff);
+        fNumGridRend->SetNumber(grend);
+        SetCheckState(fChkGridX, gax > 0.5);
+    }
     DoTrenchToggle();
+    DoGridToggle();
     std::cout << ">>> Cache params loaded: PP=" << (int)pp << " Rsh=" << rsh
               << (isTrench ? " Trench" : Form(" RsP=%.0f RsM=%.0f gap=%.1f gapP=%.1f", rsp, rsm, gap, gapp))
+              << (isGrid ? Form(" Grid offset=%.1f (%s) Rend=%.1f", goff, gax > 0.5 ? "x" : "y", grend) : "")
               << " Rin=" << rin << " Rpad=" << rpad << std::endl;
     DoCalculateGrid();
 }
@@ -1624,6 +1808,10 @@ void DoSharingTemplates() {
     f << "Rin="         << fNumRin->GetNumber()         << "\n";
     f << "PadRadius="   << fNumPadRadius->GetNumber()   << "\n";
     f << "Trench="      << (fChkTrench->IsOn() ? 1 : 0) << "\n";
+    f << "Grid="        << (GridEnabled() ? 1 : 0)      << "\n";
+    f << "GridOffset="  << fNumGridOffset->GetNumber()  << "\n";
+    f << "GridOffsetX=" << (GridShiftX() ? 1 : 0)       << "\n";
+    f << "GridRend="    << fNumGridRend->GetNumber()    << "\n";
     f << "Amplitude="   << fNumAmplitude->GetNumber()   << "\n";
     f << "Noise="       << fNumNoise->GetNumber()       << "\n";
     f << "AmpOffset="   << fNumAmpOffset->GetNumber()   << "\n";
@@ -1656,6 +1844,10 @@ void DoSharingTemplates() {
         else if (name == "Rin")         fNumRin->SetNumber(val);
         else if (name == "PadRadius")   fNumPadRadius->SetNumber(val);
         else if (name == "Trench")      fChkTrench->SetState(val ? kButtonDown : kButtonUp);
+        else if (name == "Grid")        SetCheckState(fChkGrid, val);
+        else if (name == "GridOffset")  fNumGridOffset->SetNumber(val);
+        else if (name == "GridOffsetX") SetCheckState(fChkGridX, val);
+        else if (name == "GridRend")    fNumGridRend->SetNumber(val);
         else if (name == "Amplitude")   fNumAmplitude->SetNumber(val);
         else if (name == "Noise")       fNumNoise->SetNumber(val);
         else if (name == "AmpOffset")   fNumAmpOffset->SetNumber(val);
@@ -1668,7 +1860,12 @@ void DoSharingTemplates() {
         else if (name == "Landau")      fChkLandau->SetState(val ? kButtonDown : kButtonUp);
     }
     f.close();
+    if (fChkGrid->IsOn() && (fChkTrench->IsOn() || fChkNoStruct->IsOn())) {
+        std::cout << "WARNING: strip grid conflicts with trench / no-structure; grid disabled" << std::endl;
+        fChkGrid->SetState(kButtonUp);
+    }
     DoTrenchToggle();  // sync enabled/disabled state of strip fields
+    DoGridToggle();
     std::cout << ">>> Config loaded from " << fCfgFile->GetText() << std::endl;
 }
 
@@ -1693,6 +1890,10 @@ void DoSharingTemplates() {
     if (fChkTrench->IsOn())
         key = TString::Format("PP%.0f_Rsh%.0f_tr1_Rin%.2f_Rpad%.0f",
             PP(), fNumRsheet->GetNumber(), fNumRin->GetNumber(), PadRadius());
+    else if (GridEnabled())
+        key = TString::Format("PP%.0f_Rsh%.0f_RsP%.0f_RsM%.0f_%s_tr0_Rin%.2f_Rpad%.0f",
+            PP(), fNumRsheet->GetNumber(), fNumRStripPad->GetNumber(),
+            fNumRStripMid->GetNumber(), GridKey().Data(), fNumRin->GetNumber(), PadRadius());
     else
         key = TString::Format("PP%.0f_Rsh%.0f_RsP%.0f_RsM%.0f_gap%.1f_gapP%.1f_tr0_Rin%.2f_Rpad%.0f",
             PP(), fNumRsheet->GetNumber(), fNumRStripPad->GetNumber(),
