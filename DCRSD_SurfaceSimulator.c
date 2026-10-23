@@ -43,6 +43,7 @@ private:
     TGNumberEntry       *fNumNoise, *fNumAmpOffset, *fNumConstTerm, *fNumScanStep, *fNumThreshold, *fNumRecoEvents;
     TGNumberEntry       *fNumRin;
     TGNumberEntry       *fNumPadRadius;
+    TGNumberEntry       *fNumNPad = nullptr, *fNumMargin = nullptr;
     TGTextEntry         *fCfgFile;
     TGCheckButton       *fChkTrench    = nullptr;
     TGCheckButton       *fChkNoStruct = nullptr;
@@ -56,37 +57,147 @@ private:
     TGTextButton        *fBtnReco   = nullptr;
     TGTextButton        *fBtnExport = nullptr;
 
-    const int n = 301;
+    int    fNPad   = 4;      // pads per side
+    double fMargin = 0.0;    // pad-to-edge distance in pitch units (0 = pads on the edge, as now)
+    static const int kNodesPerPitch = 100;   // mesh = 1% of pitch
+    int n = 0, nTot = 0;
+    int NPads()                       { return fNPad * fNPad; }
+    int PadID(int r, int c)           { return r * fNPad + c + 1; }   // r = x index, c = y index
+    double PadPosAt(int k, double pp) { return (k + fMargin) * pp; }
+    double PadPos(int k)              { return PadPosAt(k, PP()); }
+    int PadNodeIdx(int k)             { return (int)std::lround(PadPos(k) / Pitch()); }
     double PP()        { return fNumPixelPitch->GetNumber(); }   // pixel Pitch() [um]
-    double Pitch()     { return PP() / 100.0; }                  // grid Pitch() [um/node]
-    double Dim()       { return 3.0 * PP(); }                    // total detector size [um]
+    double Pitch()     { return PP() / kNodesPerPitch; }         // grid Pitch() [um/node]
+    double Dim()       { return (fNPad - 1 + 2*fMargin) * PP(); } // total detector size [um]
     double PadRadius()  { return fNumPadRadius->GetNumber(); }   // pad radius [um]
     double Amplitude()  { return fNumAmplitude->GetNumber(); }   // signal amplitude [a.u.]
-    const int nTot = n * n;
+    // Mesh size depends only on the pad array, not on the pitch value
+    void ResizeMesh() {
+        n    = (int)std::lround((fNPad - 1 + 2*fMargin) * kNodesPerPitch) + 1;
+        nTot = n * n;
+        fTypeMap.assign(nTot, 0);
+        fPadOwnerMap.assign(nTot, 0);
+    }
+    // Straight strips run only between the outer pad lines (with fMargin > 0 the
+    // margin is bulk only; with fMargin = 0 this is the whole domain, as before)
+    bool InArrayAt(double u, double pp) { return u >= PadPosAt(0, pp) - 1e-6 && u <= PadPosAt(fNPad-1, pp) + 1e-6; }
+    bool InArray(double u)              { return InArrayAt(u, PP()); }
+    // Cache-key tag for the pad array; empty for the original 4x4, margin-0 layout
+    // so existing cache files stay valid
+    TString ArrayKey() {
+        return (fNPad == 4 && fMargin == 0) ? TString("")
+                                            : TString::Format("_N%d_m%.2f", fNPad, fMargin);
+    }
+
+    // Central-pixel roles (4x4: BL=6, TL=7, BR=10, TR=11)
+    enum { kBL, kTL, kBR, kTR };
+    int fCentral[4];
+    void UpdateCentral() {
+        int a = (fNPad - 1) / 2, b = a + 1;
+        fCentral[kBL] = PadID(a, a);  fCentral[kTL] = PadID(a, b);
+        fCentral[kBR] = PadID(b, a);  fCentral[kTR] = PadID(b, b);
+    }
+    int RoleOf(int id) { for (int q = 0; q < 4; q++) if (fCentral[q] == id) return q; return -1; }
+    int RoleColor(int q) { const int col[4] = { kRed, kBlue, kGreen+2, kMagenta }; return col[q]; }
+    double CLo()  { return PadPos((fNPad - 1) / 2); }   // central pixel lower edge (4x4: PP)
+    double CHi()  { return CLo() + PP(); }               // upper edge (4x4: 2*PP)
+    double CMid() { return CLo() + 0.5*PP(); }           // centre (4x4: 1.5*PP)
 
     // Bilinear charge injection at continuous (x,y) [um] onto the 4 surrounding
     // grid nodes. Replaces nearest-node rounding (TMath::Nint), which produced a
     // staircase error of up to half a node pitch, equal in x and y -> diagonal
     // shift of the exported templates.
-    // padDirect (size 17): with Rin=0 the pad nodes are Dirichlet (V=0) and would
+    // padDirect (size NPads()+1): with Rin=0 the pad nodes are Dirichlet (V=0) and would
     // swallow injected charge; weight landing on pad metal is routed directly to
     // that pad's collected current instead.
-    void InjectBilinear(TVectorD &B, double x, double y, double *padDirect = nullptr) {
+    // The 4 grid nodes surrounding (x,y) and their bilinear weights
+    void BilinearWeights(double x, double y, int idx[4], double w[4]) {
         double gx = x / Pitch(), gy = y / Pitch();
         int i0 = std::max(0, std::min(n-2, (int)std::floor(gx)));
         int j0 = std::max(0, std::min(n-2, (int)std::floor(gy)));
         double fx = std::max(0.0, std::min(1.0, gx - i0));
         double fy = std::max(0.0, std::min(1.0, gy - j0));
-        const int    ii[4] = { i0, i0+1, i0,   i0+1 };
-        const int    jj[4] = { j0, j0,   j0+1, j0+1 };
-        const double w[4]  = { (1.0-fx)*(1.0-fy), fx*(1.0-fy), (1.0-fx)*fy, fx*fy };
+        const int ii[4] = { i0, i0+1, i0,   i0+1 };
+        const int jj[4] = { j0, j0,   j0+1, j0+1 };
+        w[0] = (1.0-fx)*(1.0-fy); w[1] = fx*(1.0-fy); w[2] = (1.0-fx)*fy; w[3] = fx*fy;
+        for (int k = 0; k < 4; k++) idx[k] = ii[k]*n + jj[k];
+    }
+
+    void InjectBilinear(TVectorD &B, double x, double y, double *padDirect = nullptr) {
+        int idx[4]; double w[4];
+        BilinearWeights(x, y, idx, w);
         bool rin0 = (fNumRin->GetNumber() <= 0.0);
         for (int k = 0; k < 4; k++) {
-            int idx = ii[k]*n + jj[k];
-            if (rin0 && padDirect && fTypeMap[idx] > 0)
-                padDirect[fTypeMap[idx]] += w[k];
+            if (rin0 && padDirect && fTypeMap[idx[k]] > 0)
+                padDirect[fTypeMap[idx[k]]] += w[k];
             else
-                B(idx) += w[k];
+                B(idx[k]) += w[k];
+        }
+    }
+
+    // --- Weighting fields (reciprocity) ---
+    // The static matrix M is symmetric, so the current pad k collects from a unit
+    // injection at node s equals (M^-1 r_k)(s), where r_k is pad k's read-out:
+    //   R_in>0: r_k = e_centre(k) / R_in   (CollectCurrents: I_k = V(centre)/R_in)
+    //   R_in=0: r_k(i) = conductance from surface node i into pad k's nodes
+    // One solve per pad then gives that pad's current for EVERY injection point,
+    // instead of one solve per injection point. Results are identical to the
+    // direct solves up to rounding.
+    std::vector<TVectorD> fWField;    // central roles BL, TL, BR, TR
+    std::vector<TVectorD> fWTotal;    // sum over all pads (total collected current)
+    bool fWFieldOK = false;           // fWField matches fSolverStatic
+
+    void InvalidateWeightFields() { fWField.clear(); fWTotal.clear(); fWFieldOK = false; }
+
+    // Read-out vector of pad pad_k, or of all pads together if pad_k == 0
+    TVectorD ReadoutVector(int pad_k) {
+        TVectorD r(nTot); r.Zero();
+        double R_in = fNumRin->GetNumber();
+        if (R_in > 0) {
+            for (int k = 1; k <= NPads(); k++)
+                if (pad_k == 0 || k == pad_k) r(PadCenterNode(k)) += 1.0 / R_in;
+        } else {
+            const int di[]={1,-1,0,0}, dj[]={0,0,1,-1};
+            for (int i=0; i<n; i++) for (int j=0; j<n; j++) {
+                int idx = i*n+j;
+                if (fTypeMap[idx] != 0) continue;
+                for (int k=0; k<4; k++) {
+                    int ni=i+di[k], nj=j+dj[k];
+                    if (ni<0 || ni>=n || nj<0 || nj>=n) continue;
+                    int id = fTypeMap[ni*n+nj];
+                    if (id > 0 && (pad_k == 0 || id == pad_k)) r(idx) += GetEdgeConductance(i,j,di[k],dj[k]);
+                }
+            }
+        }
+        return r;
+    }
+
+    // Solve for the central weighting fields (and the total, if asked) once per matrix
+    bool EnsureWeightFields(TDecompSparse *solver, bool withTotal) {
+        bool ok = true, o;
+        if (!fWFieldOK) {
+            fWField.clear(); fWTotal.clear();
+            for (int q = 0; q < 4; q++) { fWField.push_back(solver->Solve(ReadoutVector(fCentral[q]), o)); ok &= o; }
+            fWFieldOK = ok;
+        }
+        if (ok && withTotal && fWTotal.empty()) { fWTotal.push_back(solver->Solve(ReadoutVector(0), o)); ok &= o; }
+        if (!ok) { std::cerr << ">>> ERROR: weighting-field solve failed" << std::endl; InvalidateWeightFields(); }
+        return ok;
+    }
+
+    // Central-pad currents (role order) from a unit bilinear injection at (x,y),
+    // matching InjectBilinear + CollectCurrents + padDirect
+    void CentralBilinear(double x, double y, double out[4]) {
+        int idx[4]; double w[4];
+        BilinearWeights(x, y, idx, w);
+        bool rin0 = (fNumRin->GetNumber() <= 0.0);
+        for (int q = 0; q < 4; q++) out[q] = 0;
+        for (int k = 0; k < 4; k++) {
+            if (rin0 && fTypeMap[idx[k]] > 0) {      // weight on pad metal goes straight to that pad
+                int q = RoleOf(fTypeMap[idx[k]]);
+                if (q >= 0) out[q] += w[k];
+            } else
+                for (int q = 0; q < 4; q++) out[q] += w[k] * fWField[q](idx[k]);
         }
     }
 
@@ -112,6 +223,7 @@ private:
             geomKey = TString::Format("PP%.0f_Rsh%.0f_RsP%.0f_RsM%.0f_gap%.1f_gapP%.1f_tr0_Rin%.2f_Rpad%.0f",
                 PP(), rsh, fNumRStripPad->GetNumber(), fNumRStripMid->GetNumber(),
                 fNumStripGap->GetNumber(), fNumStripGapPad->GetNumber(), rin, rpad);
+        geomKey += ArrayKey();
         return TString::Format("template_cache/template_%s_nx%d_off%.3f.txt",
                                 geomKey.Data(), nx, fNumAmpOffset->GetNumber());
     }
@@ -122,7 +234,7 @@ private:
         int fnx, fny; double fpp;
         f >> fnx >> fny >> fpp;
         if (fnx != nx || fny != nx) { f.close(); return false; }
-        int pIDs[4] = {7, 11, 6, 10};
+        int pIDs[4] = { fCentral[kTL], fCentral[kTR], fCentral[kBL], fCentral[kBR] };
         for (int p = 0; p < 4; p++) {
             if (fTemplatesReady && fTemplates[p]) delete fTemplates[p];
             fTemplates[p] = new TH2D(Form("fTemp_%d", pIDs[p]),
@@ -174,12 +286,14 @@ private:
     std::vector<TGTextButton*> fDepButtons; // enabled only after first Run
 
 public:
- RSDStripPanel() : TGMainFrame(gClient->GetRoot(), 1650, 900), fTypeMap(301*301, 0), fPadOwnerMap(301*301, 0), fTemplatesReady(false) {
+ RSDStripPanel() : TGMainFrame(gClient->GetRoot(), 1650, 900), fTemplatesReady(false) {
         SetCleanup(kDeepCleanup);
         gStyle->SetPalette(kBird);
         gStyle->SetOptStat(0);
 
         // Build type maps with default pitch (fNumPixelPitch not yet initialized)
+        ResizeMesh();
+        UpdateCentral();
         BuildTypeMaps(500.0);
 
         // --- GUI CONSTRUCTION ---
@@ -212,6 +326,18 @@ public:
         vCol1->AddFrame(new TGLabel(vCol1, "Pixel Pitch [um]:"), lblL);
         fNumPixelPitch = new TGNumberEntry(vCol1, 500, 6, -1, TGNumberFormat::kNESInteger, TGNumberFormat::kNEAPositive, TGNumberFormat::kNELLimitMinMax, 50, 1500);
         vCol1->AddFrame(fNumPixelPitch, entL);
+
+        // Pad array: pads per side and pad-to-edge margin, on one row
+        vCol1->AddFrame(new TGLabel(vCol1, "Pads per side / Edge margin [pitch]:"), lblL);
+        TGHorizontalFrame *hArray = new TGHorizontalFrame(vCol1);
+        TGLayoutHints *arrayL = new TGLayoutHints(kLHintsLeft, 0, 4, 0, 0);
+        fNumNPad = new TGNumberEntry(hArray, fNPad, 4, -1, TGNumberFormat::kNESInteger, TGNumberFormat::kNEAPositive, TGNumberFormat::kNELLimitMinMax, 2, 10);
+        hArray->AddFrame(fNumNPad, arrayL);
+        fNumMargin = new TGNumberEntry(hArray, fMargin, 5, -1, TGNumberFormat::kNESRealTwo, TGNumberFormat::kNEANonNegative, TGNumberFormat::kNELLimitMinMax, 0, 2);
+        hArray->AddFrame(fNumMargin, arrayL);
+        vCol1->AddFrame(hArray, entL);
+        fNumNPad->Connect("ValueSet(Long_t)", "RSDStripPanel", this, "DoArrayChange()");
+        fNumMargin->Connect("ValueSet(Long_t)", "RSDStripPanel", this, "DoArrayChange()");
 
         vCol1->AddFrame(new TGLabel(vCol1, "Thickness [um]:"), lblL);
         fNumThick = new TGNumberEntry(vCol1, 50, 6, -1, TGNumberFormat::kNESRealOne, TGNumberFormat::kNEAPositive, TGNumberFormat::kNELLimitMinMax, 10, 1000);
@@ -250,6 +376,7 @@ public:
         vCol1->AddFrame(fNumConstTerm, entL);
 
         fNumPixelPitch->Connect("ValueSet(Long_t)", "RSDStripPanel", this, "UpdateStripRLabel()");
+        fNumPixelPitch->Connect("ValueSet(Long_t)", "RSDStripPanel", this, "UpdatePosLimits()");
 
         BoldHead(vCol2, "--- Inter pixel ---");
         fChkTrench = new TGCheckButton(vCol2, "Trench between pixels");
@@ -467,12 +594,22 @@ public:
         if(fSolverTrans) delete fSolverTrans; if(fMatrixTrans) delete fMatrixTrans;
     }
 
+    // Drop the cached solvers when the mesh changes size
+    void InvalidateSolvers() {
+        delete fSolverStatic; fSolverStatic = nullptr;
+        delete fMatrixStatic; fMatrixStatic = nullptr;
+        delete fSolverTrans;  fSolverTrans  = nullptr;
+        delete fMatrixTrans;  fMatrixTrans  = nullptr;
+        fLastPPStat = fLastPPTrans = -1;   // forces BuildTypeMaps on the next GetSolver
+        InvalidateWeightFields();
+    }
+
     void BuildTypeMaps(double pp, double pad_r = 60.0) {
         std::fill(fTypeMap.begin(), fTypeMap.end(), 0);
         std::fill(fPadOwnerMap.begin(), fPadOwnerMap.end(), 0);
         bool grid = GridEnabled();
         fTypeMapGridKey = GridKey();
-        double p = pp / 100.0; // grid pitch
+        double p = pp / kNodesPerPitch; // grid pitch
         for (int i = 0; i < n; i++) {
             for (int j = 0; j < n; j++) {
                 double x = i * p, y = j * p;
@@ -480,14 +617,16 @@ public:
                 bool is_s = false;
                 double min_dp = 1e9;
                 int closest_pad = -1;
-                for (int r = 0; r < 4; r++) {
+                for (int r = 0; r < fNPad; r++) {
+                    double xr = PadPosAt(r, pp);
                     double ds = grid ? std::min(GridLineDist(x, GridShift(0)), GridLineDist(y, GridShift(1)))
-                                     : std::min(std::abs(x - r*pp), std::abs(y - r*pp));
+                                     : std::min(InArrayAt(y, pp) ? std::abs(x - xr) : 1e9,    // y-directed strip
+                                                InArrayAt(x, pp) ? std::abs(y - xr) : 1e9);   // x-directed strip
                     if (ds <= pp*0.025) is_s = true;
-                    for (int c = 0; c < 4; c++) {
-                        double dp = TMath::Hypot(x - r*pp, y - c*pp);
-                        if (dp <= pad_r) fTypeMap[idx] = (r * 4 + c) + 1;
-                        if (dp < min_dp) { min_dp = dp; closest_pad = (r*4+c)+1; }
+                    for (int c = 0; c < fNPad; c++) {
+                        double dp = TMath::Hypot(x - xr, y - PadPosAt(c, pp));
+                        if (dp <= pad_r) fTypeMap[idx] = PadID(r, c);
+                        if (dp < min_dp) { min_dp = dp; closest_pad = PadID(r, c); }
                     }
                 }
                 if (is_s) fPadOwnerMap[idx] = closest_pad;
@@ -522,9 +661,9 @@ public:
     // (axis 0: x-positions of the y-directed strips, 1: y-positions of the x-directed ones).
     double GridShift(int axis) { return (GridShiftX() == (axis == 0)) ? fNumGridOffset->GetNumber() : 0.0; }
 
-    // Distance from coordinate u to the nearest strip line k*PP - shift (any integer k)
+    // Distance from coordinate u to the nearest strip line PadPos(k) - shift (any integer k)
     double GridLineDist(double u, double shift) {
-        double m = std::fmod(u + shift, PP());
+        double m = std::fmod(u + shift - fMargin*PP(), PP());
         if (m < 0) m += PP();
         return std::min(m, PP() - m);
     }
@@ -541,7 +680,7 @@ public:
     // where it leaves the domain (2 at a corner where both strip families end).
     int GridStripEnds(int i, int j) {
         auto onCentre = [&](int k, double shift) {
-            double u = k * Pitch() + shift;
+            double u = k * Pitch() + shift - fMargin*PP();
             double d = u - std::round(u / PP()) * PP();
             return d > -0.5*Pitch() && d <= 0.5*Pitch();
         };
@@ -579,12 +718,23 @@ public:
         }
     }
 
-    // Center node of pad k (1..16): the single representative that drains to GND via R_in
+    // Center node of pad k (1..NPads()): the single representative that drains to GND via R_in
     int PadCenterNode(int pad_k) {
-        int r = (pad_k-1)/4, c = (pad_k-1)%4;
-        int pi = std::max(0, std::min(n-1, (int)TMath::Nint(r * PP() / Pitch())));
-        int pj = std::max(0, std::min(n-1, (int)TMath::Nint(c * PP() / Pitch())));
+        int r = (pad_k-1) / fNPad, c = (pad_k-1) % fNPad;
+        int pi = std::clamp(PadNodeIdx(r), 0, n-1);
+        int pj = std::clamp(PadNodeIdx(c), 0, n-1);
         return pi*n + pj;
+    }
+
+    // Pads as filled circles: central four in their role colours, the rest gray
+    void DrawPads(double radius) {
+        for (int r = 0; r < fNPad; r++)
+            for (int c = 0; c < fNPad; c++) {
+                int q = RoleOf(PadID(r, c));
+                int col = (q >= 0) ? RoleColor(q) : kGray;
+                TEllipse *el = new TEllipse(PadPos(r), PadPos(c), radius, radius);
+                el->SetFillColor(col); el->SetLineColor(col); el->Draw("SAME");
+            }
     }
 
     void SetStatus(const char* msg, bool busy) {
@@ -601,6 +751,33 @@ public:
         gSystem->Sleep(busy ? 80 : 50);
         gSystem->ProcessEvents();
         gVirtualX->Update(1);
+    }
+
+    // Injection X/Y limits follow the detector size (Dim depends on pitch and pad array)
+    void UpdatePosLimits() {
+        double d = Dim();
+        fNumX->SetLimitValues(0, d); fNumY->SetLimitValues(0, d);
+        if (fNumX->GetNumber() > d) fNumX->SetNumber(d);
+        if (fNumY->GetNumber() > d) fNumY->SetNumber(d);
+    }
+
+    // Pad array changed: resize the mesh, drop the solvers and require a new matrix
+    void DoArrayChange() {
+        int    np = (int)fNumNPad->GetNumber();
+        double m  = std::round(fNumMargin->GetNumber() * kNodesPerPitch) / kNodesPerPitch;  // pads on mesh nodes
+        fNumMargin->SetNumber(m);
+        if (np == fNPad && m == fMargin) return;
+        fNPad = np; fMargin = m;
+        ResizeMesh(); UpdateCentral(); InvalidateSolvers();
+        UpdatePosLimits();
+        fNumX->SetNumber(CMid()); fNumY->SetNumber(CMid());
+        for (auto b : fDepButtons) b->SetEnabled(kFALSE);   // must recompute the matrix
+        fBtnReco->SetEnabled(kFALSE); fBtnExport->SetEnabled(kFALSE);
+        fTemplatesReady = false;
+        std::cout << ">>> Pad array " << fNPad << "x" << fNPad << ", margin " << fMargin
+                  << " pitch: mesh " << n << "x" << n << ", central pads "
+                  << fCentral[kBL] << "/" << fCentral[kTL] << "/" << fCentral[kBR] << "/" << fCentral[kTR]
+                  << " (BL/TL/BR/TR)" << std::endl;
     }
 
     void DoTrenchToggle() {
@@ -677,7 +854,7 @@ public:
     // Returns the conductance of the edge between node (i,j) and node (i+di, j+dj).
     //
     // Key rules:
-    //   0. Trench mode: edges crossing y=500,1000 (vertical) or x=500,1000 (horizontal)
+    //   0. Trench mode: edges crossing an interior pad line (4x4: x,y = PP, 2PP)
     //      have zero conductance, except within pad_r of an electrode (trench stops at pad).
     //   1. Near a pad (within pad_radius + half_Pitch()): always R_bulk.
     //      The metal pad provides a perfect contact — strip stops here.
@@ -685,42 +862,30 @@ public:
     //   3. Edges PERPENDICULAR to a strip: g = 1/R_bulk (bulk only).
     //   4. Bulk: g = 1/R_bulk.
     double GetEdgeConductance(int i, int j, int di, int dj) {
-        // Rule 0: Trench along electrode lines (x,y = 500, 1000 µm).
+        // Rule 0: Trench along the interior electrode lines.
         // Cuts cross-trench bulk edges, but leaves gaps at the electrode pads.
         if (TrenchEnabled()) {
             const double pad_r = PadRadius();
-            // The trench line sits exactly on node row/column k*100. Cut the edges
-            // touching that row from BOTH sides (99<->100 and 100<->101): cutting only
-            // the crossing edge attached the trench row to one pixel and shifted the
-            // whole response by one node pitch along the diagonal.
-            if (di == 0) {
-                // Vertical edge: check if it touches y = 500 or y = 1000
-                for (int k = 1; k <= 2; k++) {
-                    if ((j == k*100) != (j + dj == k*100)) {
-                        double xmid = i * Pitch();
-                        bool near_pad = false;
-                        for (int c = 0; c < 4 && !near_pad; c++)
-                            near_pad = std::abs(xmid - c*PP()) <= pad_r;
-                        if (!near_pad) return 0.0;
-                    }
-                }
-            } else {
-                // Horizontal or diagonal edge: check both x and y boundary lines
-                for (int k = 1; k <= 2; k++) {
-                    if ((i == k*100) != (i + di == k*100)) {
-                        double ymid = j * Pitch();
-                        bool near_pad = false;
-                        for (int c = 0; c < 4 && !near_pad; c++)
-                            near_pad = std::abs(ymid - c*PP()) <= pad_r;
-                        if (!near_pad) return 0.0;
-                    }
-                    if (dj != 0 && (j == k*100) != (j + dj == k*100)) {
-                        double xmid = i * Pitch();
-                        bool near_pad = false;
-                        for (int c = 0; c < 4 && !near_pad; c++)
-                            near_pad = std::abs(xmid - c*PP()) <= pad_r;
-                        if (!near_pad) return 0.0;
-                    }
+            // The trench line sits exactly on the node row/column of an interior pad
+            // line. Cut the edges touching that row from BOTH sides (L-1<->L and
+            // L<->L+1): cutting only the crossing edge attached the trench row to one
+            // pixel and shifted the whole response by one node pitch along the diagonal.
+            // Only the interior lines k = 1..fNPad-2 get a trench; with fMargin > 0 the
+            // margin stays connected to the outer pads.
+            auto nearPad = [&](double u) {
+                for (int c = 0; c < fNPad; c++)
+                    if (std::abs(u - PadPos(c)) <= pad_r) return true;
+                return false;
+            };
+            for (int k = 1; k <= fNPad - 2; k++) {
+                int L = PadNodeIdx(k);
+                if (di == 0) {
+                    // Vertical edge: crosses the x-directed trench at y = PadPos(k)
+                    if ((j == L) != (j + dj == L) && !nearPad(i * Pitch())) return 0.0;
+                } else {
+                    // Horizontal or diagonal edge: check both x and y trench lines
+                    if ((i == L) != (i + di == L) && !nearPad(j * Pitch())) return 0.0;
+                    if (dj != 0 && (j == L) != (j + dj == L) && !nearPad(i * Pitch())) return 0.0;
                 }
             }
         }
@@ -743,21 +908,21 @@ public:
             return 1.0/R_bulk + 1.0/GridStripR(along);
         }
 
-        // dj==0  →  horizontal edge (x-direction): check horizontal strips at y = k*500
-        // di==0  →  vertical edge   (y-direction): check vertical   strips at x = k*500
+        // dj==0  →  horizontal edge (x-direction): check horizontal strips at y = PadPos(k)
+        // di==0  →  vertical edge   (y-direction): check vertical   strips at x = PadPos(k)
         double gap_half     = fNumStripGap->GetNumber() / 2.0;
         double gap_pad      = fNumStripGapPad->GetNumber();   // exclusion radius around each electrode
         if (dj == 0) {
-            for (int k = 0; k < 4; k++) {
-                if (std::abs(ymid - k*PP()) <= PP()*0.025) {
+            for (int k = 0; k < fNPad; k++) {
+                if (std::abs(ymid - PadPos(k)) <= PP()*0.025 && InArray(xmid)) {
                     // Gap at midpoint between electrodes
                     if (gap_half > 0)
-                        for (int c = 0; c < 3; c++)
-                            if (std::abs(xmid - (c*PP() + PP()/2.0)) < gap_half) return 1.0/R_bulk;
+                        for (int c = 0; c < fNPad-1; c++)
+                            if (std::abs(xmid - (PadPos(c) + PP()/2.0)) < gap_half) return 1.0/R_bulk;
                     // Gap at pad: strip ends before reaching the electrode
                     double min_d = 1e9;
-                    for (int c = 0; c < 4; c++) {
-                        double d = std::abs(xmid - c*PP());
+                    for (int c = 0; c < fNPad; c++) {
+                        double d = std::abs(xmid - PadPos(c));
                         if (d < min_d) min_d = d;
                     }
                     if (gap_pad > 0 && min_d < gap_pad) return 1.0/R_bulk;
@@ -767,16 +932,16 @@ public:
                 }
             }
         } else {
-            for (int k = 0; k < 4; k++) {
-                if (std::abs(xmid - k*PP()) <= PP()*0.025) {
+            for (int k = 0; k < fNPad; k++) {
+                if (std::abs(xmid - PadPos(k)) <= PP()*0.025 && InArray(ymid)) {
                     // Gap at midpoint between electrodes
                     if (gap_half > 0)
-                        for (int c = 0; c < 3; c++)
-                            if (std::abs(ymid - (c*PP() + PP()/2.0)) < gap_half) return 1.0/R_bulk;
+                        for (int c = 0; c < fNPad-1; c++)
+                            if (std::abs(ymid - (PadPos(c) + PP()/2.0)) < gap_half) return 1.0/R_bulk;
                     // Gap at pad: strip ends before reaching the electrode
                     double min_d = 1e9;
-                    for (int c = 0; c < 4; c++) {
-                        double d = std::abs(ymid - c*PP());
+                    for (int c = 0; c < fNPad; c++) {
+                        double d = std::abs(ymid - PadPos(c));
                         if (d < min_d) min_d = d;
                     }
                     if (gap_pad > 0 && min_d < gap_pad) return 1.0/R_bulk;
@@ -807,30 +972,30 @@ public:
         double min_dist_pad_center = 1e9;
         bool is_s = false;
 
-        for(int k=0; k<4; k++) {
-            bool on_hstrip = std::abs(y - k*PP()) <= PP()*0.025;
-            bool on_vstrip = std::abs(x - k*PP()) <= PP()*0.025;
+        for(int k=0; k<fNPad; k++) {
+            bool on_hstrip = std::abs(y - PadPos(k)) <= PP()*0.025 && InArray(x);
+            bool on_vstrip = std::abs(x - PadPos(k)) <= PP()*0.025 && InArray(y);
 
             // Check midpoint gap
             if (on_hstrip && gap_half > 0)
-                for(int c=0; c<3; c++)
-                    if(std::abs(x - (c*PP()+PP()/2.0)) < gap_half) { on_hstrip = false; break; }
+                for(int c=0; c<fNPad-1; c++)
+                    if(std::abs(x - (PadPos(c)+PP()/2.0)) < gap_half) { on_hstrip = false; break; }
             if (on_vstrip && gap_half > 0)
-                for(int c=0; c<3; c++)
-                    if(std::abs(y - (c*PP()+PP()/2.0)) < gap_half) { on_vstrip = false; break; }
+                for(int c=0; c<fNPad-1; c++)
+                    if(std::abs(y - (PadPos(c)+PP()/2.0)) < gap_half) { on_vstrip = false; break; }
 
             // Check pad gap: strip ends before reaching each electrode
             if (on_hstrip && gap_pad > 0)
-                for(int c=0; c<4; c++)
-                    if(std::abs(x - c*PP()) < gap_pad) { on_hstrip = false; break; }
+                for(int c=0; c<fNPad; c++)
+                    if(std::abs(x - PadPos(c)) < gap_pad) { on_hstrip = false; break; }
             if (on_vstrip && gap_pad > 0)
-                for(int c=0; c<4; c++)
-                    if(std::abs(y - c*PP()) < gap_pad) { on_vstrip = false; break; }
+                for(int c=0; c<fNPad; c++)
+                    if(std::abs(y - PadPos(c)) < gap_pad) { on_vstrip = false; break; }
 
             if (on_hstrip || on_vstrip) is_s = true;
 
-            for(int c=0; c<4; c++) {
-                double dp = TMath::Hypot(x - k*PP(), y - c*PP());
+            for(int c=0; c<fNPad; c++) {
+                double dp = TMath::Hypot(x - PadPos(k), y - PadPos(c));
                 if(dp - PadRadius() <= 0) is_s = true;
                 if(dp < min_dist_pad_center) min_dist_pad_center = dp;
             }
@@ -846,12 +1011,9 @@ public:
     void CalculatePropagation(double injX, double injY, std::vector<double>& out_delays, std::vector<TGraph*>& out_paths) {
         double thick_um = fNumThick->GetNumber();
         
-        int targets[4] = {6, 7, 10, 11};
-        int targetCenters[4] = {100*n + 100, 100*n + 200, 200*n + 100, 200*n + 200};
-
-        for (int idx = 0; idx < 4; idx++) {
-            int targetID = targets[idx];
-            int targetCenter = targetCenters[idx];
+        for (int idx = 0; idx < 4; idx++) {   // role order: BL, TL, BR, TR
+            int targetID = fCentral[idx];
+            int targetCenter = PadCenterNode(targetID);
 
             int injI = TMath::Nint(injX/Pitch());
             int injJ = TMath::Nint(injY/Pitch());
@@ -869,7 +1031,8 @@ public:
 
             int di[8] = {1, -1, 0, 0, 1, 1, -1, -1};
             int dj[8] = {0, 0, 1, -1, 1, -1, 1, -1};
-            double ds_mm[8] = { 0.005, 0.005, 0.005, 0.005, 0.005*1.414213, 0.005*1.414213, 0.005*1.414213, 0.005*1.414213 };
+            const double h_mm = Pitch()*1e-3, hd_mm = h_mm*M_SQRT2;
+            double ds_mm[8] = { h_mm, h_mm, h_mm, h_mm, hd_mm, hd_mm, hd_mm, hd_mm };
 
             while(!pq.empty()) {
                 double d = pq.top().first;
@@ -942,7 +1105,7 @@ public:
         double R_in = fNumRin->GetNumber();
         if (R_in > 0) {
             // Only the representative (center) node of each pad drains via R_in
-            for (int k=1; k<=16; k++) {
+            for (int k=1; k<=NPads(); k++) {
                 double I = V(PadCenterNode(k)) / R_in;
                 cur[k] += I; iTot += I;
             }
@@ -977,15 +1140,17 @@ public:
             if (fSolverStatic) delete fSolverStatic; if (fMatrixStatic) delete fMatrixStatic;
             fMatrixStatic = nullptr;
             // --- On-disk cache ---
-            gSystem->mkdir("rsd_cache", kTRUE);
-            gSystem->mkdir(TString::Format("rsd_cache/PP%.0f", pp).Data(), kTRUE);
+            // Same node count can come from different arrays (4x4 margin 0.5 and 5x5
+            // margin 0 both give n = 401), so the array is part of the directory and key
+            TString arrayKey = ArrayKey();
+            TString ppDir = TString::Format("rsd_cache/PP%.0f%s", pp, arrayKey.Data());
             TString cacheDir;
             if (trench)
-                cacheDir = TString::Format("rsd_cache/PP%.0f/trench", pp);
+                cacheDir = ppDir + "/trench";
             else if (!gridKey.IsNull())
-                cacheDir = TString::Format("rsd_cache/PP%.0f/grid_RsP%.0f_RsM%.0f", pp, R_sP, R_sM);
+                cacheDir = ppDir + TString::Format("/grid_RsP%.0f_RsM%.0f", R_sP, R_sM);
             else
-                cacheDir = TString::Format("rsd_cache/PP%.0f/RsP%.0f_RsM%.0f", pp, R_sP, R_sM);
+                cacheDir = ppDir + TString::Format("/RsP%.0f_RsM%.0f", R_sP, R_sM);
             gSystem->mkdir(cacheDir.Data(), kTRUE);
             TString cacheKey;
             if (trench)
@@ -1000,6 +1165,7 @@ public:
                 cacheKey = TString::Format(
                     "PP%.0f_Rsh%.0f_RsP%.0f_RsM%.0f_gap%.1f_gapP%.1f_tr0_Rin%.2f_Rpad%.0f",
                     pp, R_sh, R_sP, R_sM, gap, gap_pad, rin, pad_r);
+            cacheKey += arrayKey;
             TString cachePath = cacheDir + "/matrix_" + cacheKey + ".root";
             if (!gSystem->AccessPathName(cachePath.Data())) {  // file exists
                 TFile *fcache = TFile::Open(cachePath.Data(), "READ");
@@ -1024,6 +1190,7 @@ public:
                 }
             }
             fSolverStatic = new TDecompSparse(); fSolverStatic->SetMatrix(*fMatrixStatic); fSolverStatic->Decompose();
+            InvalidateWeightFields();
             fLastRsheetStat = R_sh; fLastRStripPStat = R_sP; fLastRStripMStat = R_sM; fLastGapStat = gap; fLastGapPadStat = gap_pad; fLastPPStat = pp; fLastTrenchStat = trench; fLastRinStat = rin; fLastPadRadiusStat = pad_r; fLastGridKeyStat = gridKey;
             return fSolverStatic;
         } else {
@@ -1042,6 +1209,17 @@ public:
         }
     }
 
+    // Sparse-matrix entries collected as (row, col, value) triplets and loaded into the
+    // matrix in one call. Assigning M(i,j) entry by entry inserts into the sparse
+    // storage each time, which grows with the square of the node count (~10 min for
+    // the 4x4 mesh, over an hour for 6x6); this takes about a second.
+    struct Triplets {
+        std::vector<int> row, col; std::vector<double> val;
+        void reserve(size_t k) { row.reserve(k); col.reserve(k); val.reserve(k); }
+        void add(int r, int c, double v) { row.push_back(r); col.push_back(c); val.push_back(v); }
+        void fill(TMatrixDSparse &M) { M.SetMatrixArray((Int_t)val.size(), row.data(), col.data(), val.data()); }
+    };
+
     void BuildMatrix(TMatrixDSparse &M, bool transient, double diagAdd) {
         double R_in = fNumRin->GetNumber();
         bool use_Rin = (R_in > 0);
@@ -1050,13 +1228,14 @@ public:
         // Strip grid: strip ends drain to GND through R_end (diagonal only, keeps M symmetric)
         const double G_end = GridEnabled() ? 1.0/fNumGridRend->GetNumber() : 0.0;
         const int di[] = {1,-1,0,0}, dj[] = {0,0,1,-1};
+        Triplets T; T.reserve(5*(size_t)nTot);
         for (int i=0; i<n; i++) {
             for (int j=0; j<n; j++) {
                 int idx = i*n + j;
                 int pad_k = fTypeMap[idx];
 
                 // Pad node, R_in=0: force V=0 (perfect sink)
-                if (pad_k > 0 && !use_Rin) { M(idx, idx) = 1.0 + diagAdd; continue; }
+                if (pad_k > 0 && !use_Rin) { T.add(idx, idx, 1.0 + diagAdd); continue; }
 
                 // Pad node, R_in>0: equipotential metal pad model
                 if (pad_k > 0 && use_Rin) {
@@ -1071,15 +1250,15 @@ public:
                             if (npad == 0) {
                                 // Surface neighbor: current flows in from resistive layer
                                 double cond = GetEdgeConductance(i, j, di[k2], dj[k2]);
-                                sum_g += cond; M(idx, ni*n+nj) = -cond;
+                                sum_g += cond; T.add(idx, ni*n+nj, -cond);
                             } else if (npad == pad_k) {
                                 // Same-pad neighbor: short circuit (equipotential metal)
-                                sum_g += G_short; M(idx, ni*n+nj) = -G_short;
+                                sum_g += G_short; T.add(idx, ni*n+nj, -G_short);
                             }
                             // Different pad: no connection (separate metal contacts)
                         }
                     }
-                    M(idx, idx) = sum_g;
+                    T.add(idx, idx, sum_g);
                     continue;
                 }
 
@@ -1091,12 +1270,13 @@ public:
                     if (ni>=0&&ni<n&&nj>=0&&nj<n) {
                         double cond = GetEdgeConductance(i, j, di[k2], dj[k2]);
                         sum_g += cond;
-                        if (fTypeMap[ni*n+nj] == 0 || use_Rin) M(idx, ni*n+nj) = -cond;
+                        if (fTypeMap[ni*n+nj] == 0 || use_Rin) T.add(idx, ni*n+nj, -cond);
                     }
                 }
-                M(idx, idx) = sum_g;
+                T.add(idx, idx, sum_g);
             }
         }
+        T.fill(M);
     }
 
 
@@ -1118,17 +1298,7 @@ public:
             }
         c->cd(1); gPad->SetLogz();
         hResGrid->Draw("COLZ");
-        struct PadColor { int r, c, color; };
-        PadColor padColors[] = {
-            {0,0,kGray},{0,1,kGray},{0,2,kGray},{0,3,kGray},
-            {1,0,kGray},{1,1,kRed},{1,2,kBlue},{1,3,kGray},
-            {2,0,kGray},{2,1,kGreen+2},{2,2,kMagenta},{2,3,kGray},
-            {3,0,kGray},{3,1,kGray},{3,2,kGray},{3,3,kGray}
-        };
-        for (auto &p : padColors) {
-            TEllipse *el = new TEllipse(p.r*PP(), p.c*PP(), PadRadius(), PadRadius());
-            el->SetFillColor(p.color); el->SetLineColor(p.color); el->Draw("SAME");
-        }
+        DrawPads(PadRadius());
         c->Modified();
         c->Update();
         gSystem->ProcessEvents();
@@ -1153,7 +1323,7 @@ void DoInjectCharge() {
     c->cd(1); gPad->SetLogz(); TH2D *hRes = new TH2D("hRes", "Local Resistivity [Ohm/sq]", n, 0, Dim(), n, 0, Dim());
     c->cd(2); TH2D *hPot = new TH2D("hPot", "Static Potential Map", n, 0, Dim(), n, 0, Dim());
     
-    std::vector<double> I_out(17, 0.0);
+    std::vector<double> I_out(NPads() + 1, 0.0);
     double iTotal = 0;
     CollectCurrents(V, I_out, iTotal);
 
@@ -1168,48 +1338,26 @@ void DoInjectCharge() {
     
     if (iTotal < 0.9)
         std::cout << ">>> WARNING: Total collected current = " << iTotal << " (expected 1.0)" << std::endl;
-    double fracCentral = (iTotal > 0) ? (I_out[6]+I_out[7]+I_out[10]+I_out[11])/iTotal : 0;
+    double fracCentral = (iTotal > 0) ? (I_out[fCentral[kBL]]+I_out[fCentral[kTL]]+I_out[fCentral[kBR]]+I_out[fCentral[kTR]])/iTotal : 0;
     printf(">>> Central 4 pads fraction: %.1f %%\n", fracCentral * 100.0);
     
-    // Pad colors: 6=red, 7=blue, 10=green+2, 11=magenta, others=gray
-    struct PadColor { int r, c, color; };
-    PadColor padColors[] = {
-        {0,0,kGray},{0,1,kGray},{0,2,kGray},{0,3,kGray},
-        {1,0,kGray},{1,1,kRed},{1,2,kBlue},{1,3,kGray},
-        {2,0,kGray},{2,1,kGreen+2},{2,2,kMagenta},{2,3,kGray},
-        {3,0,kGray},{3,1,kGray},{3,2,kGray},{3,3,kGray}
-    };
-    c->cd(1); hRes->Draw("COLZ");
-    for (auto &p : padColors) {
-        TEllipse *el = new TEllipse(p.r*PP(), p.c*PP(), PP()*0.05, PP()*0.05);
-        el->SetFillColor(p.color); el->SetLineColor(p.color);
-        el->Draw("SAME");
-    }
-    c->cd(2); hPot->Draw("COLZ");
-    for (auto &p : padColors) {
-        TEllipse *el = new TEllipse(p.r*PP(), p.c*PP(), PP()*0.05, PP()*0.05);
-        el->SetFillColor(p.color); el->SetLineColor(p.color);
-        el->Draw("SAME");
-    }
+    // Pad colors: BL=red, TL=blue, BR=green+2, TR=magenta (4x4: 6, 7, 10, 11), others=gray
+    c->cd(1); hRes->Draw("COLZ"); DrawPads(PP()*0.05);
+    c->cd(2); hPot->Draw("COLZ"); DrawPads(PP()*0.05);
     c->cd(3);
-    TH1D *hI    = new TH1D("hI",    "Charge Fractions;Pad ID;Fraction", 16, 0.5, 16.5);
-    TH1D *hI6   = new TH1D("hI6",   "", 16, 0.5, 16.5);
-    TH1D *hI7   = new TH1D("hI7",   "", 16, 0.5, 16.5);
-    TH1D *hI10  = new TH1D("hI10",  "", 16, 0.5, 16.5);
-    TH1D *hI11  = new TH1D("hI11",  "", 16, 0.5, 16.5);
-    for(int k=1; k<=16; k++) {
+    const int nb = NPads();
+    TH1D *hI = new TH1D("hI", "Charge Fractions;Pad ID;Fraction", nb, 0.5, nb + 0.5);
+    const char *hqName[4] = { "hI6", "hI7", "hI10", "hI11" };   // BL, TL, BR, TR
+    TH1D *hq[4];
+    for (int q = 0; q < 4; q++) hq[q] = new TH1D(hqName[q], "", nb, 0.5, nb + 0.5);
+    for(int k=1; k<=nb; k++) {
         double frac = (iTotal>0) ? I_out[k]/iTotal : 0;
         hI->SetBinContent(k, frac);
-        if (k==6)  hI6->SetBinContent(k, frac);
-        if (k==7)  hI7->SetBinContent(k, frac);
-        if (k==10) hI10->SetBinContent(k, frac);
-        if (k==11) hI11->SetBinContent(k, frac);
+        int q = RoleOf(k);
+        if (q >= 0) hq[q]->SetBinContent(k, frac);
     }
     hI->SetFillColor(kGray); hI->Draw("BAR TEXT0");
-    hI6->SetFillColor(kRed);      hI6->Draw("BAR SAME");
-    hI7->SetFillColor(kBlue);     hI7->Draw("BAR SAME");
-    hI10->SetFillColor(kGreen+2); hI10->Draw("BAR SAME");
-    hI11->SetFillColor(kMagenta); hI11->Draw("BAR SAME");
+    for (int q = 0; q < 4; q++) { hq[q]->SetFillColor(RoleColor(q)); hq[q]->Draw("BAR SAME"); }
     c->Update();
     SetStatus("  Ready  ", false);
 }
@@ -1260,7 +1408,7 @@ void DoInjectCharge() {
             double inputVal = 0; if (t > 5 && t <= 10) { inputVal = 10.0; B(injIdx) += inputVal; }
             bool ok; V = solver->Solve(B, ok); 
 
-            double i6=0, i7=0, i10=0, i11=0;
+            double iq[4] = {0, 0, 0, 0};   // BL, TL, BR, TR
             const int di[]={1,-1,0,0}, dj[]={0,0,1,-1};
             for (int i=0; i<n; i++) { for (int j=0; j<n; j++) {
                 int idx = i*n+j;
@@ -1271,11 +1419,12 @@ void DoInjectCharge() {
                             double cond = GetEdgeConductance(i, j, di[k], dj[k]);
                             double cur  = V(idx) * cond;
                             int id = fTypeMap[ni*n+nj];
-                            if (id==6) i6+=cur; else if (id==7) i7+=cur; else if (id==10) i10+=cur; else if (id==11) i11+=cur;
+                            int q = RoleOf(id); if (q >= 0) iq[q] += cur;
                         }
                     }
                 }
             }}
+            double i6 = iq[kBL], i7 = iq[kTL], i10 = iq[kBR], i11 = iq[kTR];
             
             double time_ns = t * dt * 1e9;
             
@@ -1309,10 +1458,10 @@ void DoInjectCharge() {
         
         TLegend *leg = new TLegend(0.75, 0.6, 0.95, 0.9);
         leg->AddEntry(gInput, "Input Pulse (T0)", "l"); 
-        leg->AddEntry(gP6, "Pad 6", "l"); 
-        leg->AddEntry(gP7, "Pad 7", "l");
-        leg->AddEntry(gP10, "Pad 10", "l"); 
-        leg->AddEntry(gP11, "Pad 11", "l");
+        leg->AddEntry(gP6,  Form("Pad %d", fCentral[kBL]), "l");
+        leg->AddEntry(gP7,  Form("Pad %d", fCentral[kTL]), "l");
+        leg->AddEntry(gP10, Form("Pad %d", fCentral[kBR]), "l");
+        leg->AddEntry(gP11, Form("Pad %d", fCentral[kTR]), "l");
         leg->Draw(); cScope->Update(); cScope->RaiseWindow();
         SetStatus("  Ready  ", false);
     }
@@ -1327,25 +1476,26 @@ void DoInjectCharge() {
     void RunScan(int mode) {
         SetStatus("  Computing...  ", true);
         TDecompSparse *solver = GetSolver(false);
+        if (!EnsureWeightFields(solver, true)) { SetStatus("  Ready  ", false); return; }
         int    nx      = (int)fNumScanStep->GetNumber();
-        double scanMin = (mode == 0) ? PP()      : 0.0;
-        double scanMax = (mode == 0) ? 2.0*PP()  : Dim();
+        double scanMin = (mode == 0) ? CLo() : 0.0;
+        double scanMax = (mode == 0) ? CHi() : Dim();
         const double step = PP() / nx;
         int nBins = (int)((scanMax - scanMin) / step) + 1;
         TString title;
         if (mode==0) title = "Central 4 Pads Fraction";
-        else if (mode==1) title = "Pad 6 Fraction";
-        else if (mode==2) title = "Limit: Pad 6 < 5%";
-        else if (mode==3) title = "Blind Zone: Pad 6 & 7 < 5%";
+        else if (mode==1) title = Form("Pad %d Fraction", fCentral[kBL]);
+        else if (mode==2) title = Form("Limit: Pad %d < 5%%", fCentral[kBL]);
+        else if (mode==3) title = Form("Blind Zone: Pad %d & %d < 5%%", fCentral[kBL], fCentral[kTL]);
         else if (mode==4) title = "Max 1 Pad Fraction";
         else if (mode==5) title = "Max 2 Pads Fraction";
 
         const char* cNames[] = { "cScan0","cScan1","cScan2","cScan3","cScan4","cScan5" };
-        const char* cTitles[]= {
+        TString cTitles[]= {
             "c2a - Central 4 pads fraction",
-            "c2b - Pad 6 fraction",
-            "c2c - Pad 6 < threshold",
-            "c2d - Pad 6 & 7 < threshold",
+            Form("c2b - Pad %d fraction", fCentral[kBL]),
+            Form("c2c - Pad %d < threshold", fCentral[kBL]),
+            Form("c2d - Pad %d & %d < threshold", fCentral[kBL], fCentral[kTL]),
             "c2e - Max 1 pad fraction",
             "c2f - Max 2 pads fraction"
         };
@@ -1389,26 +1539,25 @@ void DoInjectCharge() {
             double x = scanMin + ix * step;
             for (int iy = 0; iy < nBins; iy++) {
                 double y = scanMin + iy * step;
-                TVectorD B_s(nTot); B_s.Zero(); int idx = TMath::Nint(x/Pitch())*n + TMath::Nint(y/Pitch()); if (idx >= nTot) idx = nTot - 1; B_s(idx) = 1.0;
-                bool ok; TVectorD V_s = solver->Solve(B_s, ok);
+                int idx = TMath::Nint(x/Pitch())*n + TMath::Nint(y/Pitch()); if (idx >= nTot) idx = nTot - 1;
+                // Unit injection at idx, read from the weighting fields (no solve per point)
+                double iTotal = fWTotal[0](idx);
 
-                std::vector<double> i_out(17, 0.0); double iTotal = 0;
-                CollectCurrents(V_s, i_out, iTotal);
-                
-                double val = 0; double f6 = (iTotal>0)?i_out[6]/iTotal:0; double f7 = (iTotal>0)?i_out[7]/iTotal:0;
-                std::vector<double> central = {i_out[6], i_out[7], i_out[10], i_out[11]};
+                double val = 0;
+                double fBL = (iTotal>0)?fWField[kBL](idx)/iTotal:0; double fTL = (iTotal>0)?fWField[kTL](idx)/iTotal:0;
+                std::vector<double> central = {fWField[kBL](idx), fWField[kTL](idx), fWField[kBR](idx), fWField[kTR](idx)};
                 std::sort(central.begin(), central.end(), std::greater<double>());
 
-                if (mode == 0) val = (i_out[6]+i_out[7]+i_out[10]+i_out[11])/iTotal;
-                else if (mode == 1) val = f6;
-                else if (mode == 2) val = (f6 < fNumThreshold->GetNumber()/100.0) ? 1.0 : 0.0;
-                else if (mode == 3) val = (f6 < fNumThreshold->GetNumber()/100.0 && f7 < fNumThreshold->GetNumber()/100.0) ? 1.0 : 0.0;
+                if (mode == 0) val = (central[0]+central[1]+central[2]+central[3])/iTotal;
+                else if (mode == 1) val = fBL;
+                else if (mode == 2) val = (fBL < fNumThreshold->GetNumber()/100.0) ? 1.0 : 0.0;
+                else if (mode == 3) val = (fBL < fNumThreshold->GetNumber()/100.0 && fTL < fNumThreshold->GetNumber()/100.0) ? 1.0 : 0.0;
                 else if (mode == 4) val = (iTotal>0) ? central[0]/iTotal : 0;
                 else if (mode == 5) val = (iTotal>0) ? (central[0]+central[1])/iTotal : 0;
 
                 hScan->Fill(x, y, val);
                 if (hLeak) hLeak->Fill(x, y, iTotal > 0 ? 1.0 - val : 0.0);
-                if (mode == 0 && x >= PP() && x <= 2*PP() && y >= PP()+PadRadius() && y <= 2*PP()-PadRadius()) {
+                if (mode == 0 && x >= CLo() && x <= CHi() && y >= CLo()+PadRadius() && y <= CHi()-PadRadius()) {
                     sumReadX[ix] += val;
                     sum2ReadX[ix] += val*val;
                     double lval = iTotal > 0 ? 1.0 - val : 0.0;
@@ -1459,14 +1608,14 @@ void DoInjectCharge() {
             }
             cScan->cd(3); gPad->SetGrid();
             hProjRead->SetMinimum(0); hProjRead->SetMaximum(1);
-            hProjRead->GetXaxis()->SetRangeUser(PP(), 2*PP());
+            hProjRead->GetXaxis()->SetRangeUser(CLo(), CHi());
             hProjRead->SetMarkerStyle(20); hProjRead->SetMarkerSize(0.8);
             hProjRead->SetMarkerColor(kTeal-5); hProjRead->SetLineColor(kTeal-5);
             hProjRead->Draw("E1");
 
             cScan->cd(4); gPad->SetGrid();
             hProjLost->SetMinimum(0); hProjLost->SetMaximum(1);
-            hProjLost->GetXaxis()->SetRangeUser(PP(), 2*PP());
+            hProjLost->GetXaxis()->SetRangeUser(CLo(), CHi());
             hProjLost->SetMarkerStyle(20); hProjLost->SetMarkerSize(0.8);
             hProjLost->SetMarkerColor(kOrange-3); hProjLost->SetLineColor(kOrange-3);
             hProjLost->Draw("E1");
@@ -1478,6 +1627,7 @@ void DoInjectCharge() {
     void DoResolutionAnalysis() {
         SetStatus("  Computing...  ", true);
         TDecompSparse *solver = GetSolver(false);
+        if (!EnsureWeightFields(solver, false)) { SetStatus("  Ready  ", false); return; }
         TRandom3 rand(0);
 
         double noise_rms = fNumNoise->GetNumber();
@@ -1510,8 +1660,8 @@ void DoInjectCharge() {
         std::cout << "--- Unbalance Resolution (" << nEvents << " random events, Noise=" << noise_rms << ") ---" << std::endl;
 
         for (int ev = 0; ev < nEvents; ev++) {
-            double x = PP() + rand.Rndm() * PP();
-            double y = PP() + rand.Rndm() * PP();
+            double x = CLo() + rand.Rndm() * PP();
+            double y = CLo() + rand.Rndm() * PP();
 
             int ii  = std::max(0, std::min(n-1, TMath::Nint(x/Pitch())));
             int jj  = std::max(0, std::min(n-1, TMath::Nint(y/Pitch())));
@@ -1520,22 +1670,20 @@ void DoInjectCharge() {
             // Skip events landing on an electrode pad (no sharing in the real sensor)
             if (fTypeMap[idx] > 0) { nSkipped++; continue; }
 
-            TVectorD B_s(nTot); B_s.Zero(); B_s(idx) = 1.0;
-            bool ok; TVectorD V_s = solver->Solve(B_s, ok);
-            if (!ok) { nSkipped++; continue; }
-
-            std::vector<double> cur4(17, 0.0); double iTot4 = 0;
-            CollectCurrents(V_s, cur4, iTot4);
+            // Unit injection at idx, read from the weighting fields (role order)
+            double cur4[4];
             { double ao = fNumAmpOffset->GetNumber() / Amplitude();
-              cur4[6] += ao; cur4[7] += ao; cur4[10] += ao; cur4[11] += ao; }
+              for (int q = 0; q < 4; q++) cur4[q] = fWField[q](idx) + ao; }
             double amp = Amplitude();
-            double A6 = cur4[6]*amp, A7 = cur4[7]*amp, A10 = cur4[10]*amp, A11 = cur4[11]*amp;
+            // A6/A7/A10/A11 = BL/TL/BR/TR (pad IDs of the 4x4 layout)
+            double A6  = cur4[kBL]*amp, A7  = cur4[kTL]*amp;
+            double A10 = cur4[kBR]*amp, A11 = cur4[kTR]*amp;
 
             // No-noise linearity
             double s4nl = A6+A7+A10+A11;
-            double xr_nl = (s4nl > 1e-9) ? PP()*1.5 + ((A10+A11)-(A6+A7))/s4nl * PP()/2.0 : PP()*1.5;
-            double yr_nl = (s4nl > 1e-9) ? PP()*1.5 + ((A7+A11)-(A6+A10))/s4nl * PP()/2.0 : PP()*1.5;
-            gScatterX->SetPoint(gScatterX->GetN(), x - PP(), xr_nl - PP());
+            double xr_nl = (s4nl > 1e-9) ? CMid() + ((A10+A11)-(A6+A7))/s4nl * PP()/2.0 : CMid();
+            double yr_nl = (s4nl > 1e-9) ? CMid() + ((A7+A11)-(A6+A10))/s4nl * PP()/2.0 : CMid();
+            gScatterX->SetPoint(gScatterX->GetN(), x - CLo(), xr_nl - CLo());
 
             // Noisy reconstruction
             double L   = fChkLandau->IsOn() ? rand.Landau(1.0, 0.3) : 1.0;
@@ -1544,14 +1692,14 @@ void DoInjectCharge() {
             double a10 = L*A10 + rand.Gaus(0, noise_rms);
             double a11 = L*A11 + rand.Gaus(0, noise_rms);
             double s4  = a6+a7+a10+a11;
-            double xr  = (s4 > 1e-9) ? PP()*1.5 + ((a10+a11)-(a6+a7))/s4 * PP()/2.0 : xr_nl;
-            double yr  = (s4 > 1e-9) ? PP()*1.5 + ((a7+a11)-(a6+a10))/s4 * PP()/2.0 : yr_nl;
+            double xr  = (s4 > 1e-9) ? CMid() + ((a10+a11)-(a6+a7))/s4 * PP()/2.0 : xr_nl;
+            double yr  = (s4 > 1e-9) ? CMid() + ((a7+a11)-(a6+a10))/s4 * PP()/2.0 : yr_nl;
 
             double errX = xr - x;
             hRes1D->Fill(errX);
-            hSumE2->Fill(x - PP(), y - PP(), errX*errX);
-            hCnt  ->Fill(x - PP(), y - PP());
-            gRec ->SetPoint(count, xr - PP(), yr - PP());
+            hSumE2->Fill(x - CLo(), y - CLo(), errX*errX);
+            hCnt  ->Fill(x - CLo(), y - CLo());
+            gRec ->SetPoint(count, xr - CLo(), yr - CLo());
             count++;
 
             if (ev % 1000 == 0) gSystem->ProcessEvents();
@@ -1625,12 +1773,14 @@ void DoSharingTemplates() {
         std::cout << ">>> Sharing Templates loaded from cache: " << cachePath << std::endl;
     } else {
         TDecompSparse *solver = GetSolver(false);
+        if (!EnsureWeightFields(solver, false)) { SetStatus("  Ready  ", false); return; }
         double step = PP() / nx;
 
         double min_ax = 0;
         double max_ax = PP();
 
-        int pIDs[4] = {7, 11, 6, 10};
+        int pIDs[4]  = { fCentral[kTL], fCentral[kTR], fCentral[kBL], fCentral[kBR] };
+        int pRole[4] = { kTL, kTR, kBL, kBR };   // same order as pIDs
 
         for(int i=0; i<4; i++) {
             if(fTemplatesReady && fTemplates[i]) delete fTemplates[i];
@@ -1640,38 +1790,31 @@ void DoSharingTemplates() {
             fTemplates[i]->SetStats(0);
         }
 
-        std::cout << ">>> Computing Sharing Templates in the central pixel (500-1000 um)..." << std::endl;
+        std::cout << ">>> Computing Sharing Templates in the central pixel (" << CLo() << "-" << CHi() << " um)..." << std::endl;
 
-        // Loop at bin centres of the central pixel [PP, 2*PP]
-        for (double x = PP()+step/2.0; x <= PP()*2.0-step/2.0+1e-6; x += step) {
-            for (double y = PP()+step/2.0; y <= PP()*2.0-step/2.0+1e-6; y += step) {
+        // Loop at bin centres of the central pixel [CLo, CHi]
+        for (double x = CLo()+step/2.0; x <= CHi()-step/2.0+1e-6; x += step) {
+            for (double y = CLo()+step/2.0; y <= CHi()-step/2.0+1e-6; y += step) {
 
-                TVectorD B(nTot); B.Zero();
-                double padDirect[17] = {0};
-                InjectBilinear(B, x, y, padDirect);
-
-                bool ok;
-                TVectorD V = solver->Solve(B, ok);
-
-                std::vector<double> cur(17, 0.0);
-                double iTot = 0;
-                CollectCurrents(V, cur, iTot);
-                for (int k = 1; k <= 16; k++) { cur[k] += padDirect[k]; iTot += padDirect[k]; }
+                // Bilinear unit injection, read from the weighting fields (role order)
+                double c4[4];
+                CentralBilinear(x, y, c4);
 
                 // normalize to 1 over the 4 central pads
                 double ampOffset = fNumAmpOffset->GetNumber() / Amplitude();
-                for(int p=0; p<4; p++) cur[pIDs[p]] += ampOffset;
+                double cur[4];
+                for(int p=0; p<4; p++) cur[p] = c4[pRole[p]] + ampOffset;
                 double iTot4 = 0;
                 for(int p=0; p<4; p++) {
-              iTot4 += cur[pIDs[p]];
+              iTot4 += cur[p];
                 }
 
                 for(int p=0; p<4; p++) {
-              fTemplates[p]->Fill(x - PP(), y - PP(), (iTot4 > 0) ? cur[pIDs[p]]/iTot4 : 0);
+              fTemplates[p]->Fill(x - CLo(), y - CLo(), (iTot4 > 0) ? cur[p]/iTot4 : 0);
                 }
             }
             gSystem->ProcessEvents(); // prevent GUI from freezing
-            std::cout << "Progress: " << (int)((x - PP()) / PP() * 100.0) << "%" << std::endl;
+            std::cout << "Progress: " << (int)((x - CLo()) / PP() * 100.0) << "%" << std::endl;
         }
 
         SaveTemplateToDisk(cachePath, nx);
@@ -1757,6 +1900,10 @@ void DoSharingTemplates() {
         std::cout << "ERROR: cannot parse grid parameters from cache filename: " << fn << std::endl;
         return;
     }
+    // Pad array tag (absent = original 4x4, margin 0)
+    double npad = 4, marg = 0;
+    extract("_N", npad);
+    extract("_m", marg);
 
     fNumPixelPitch->SetNumber((int)pp);
     fNumRsheet->SetNumber(rsh);
@@ -1775,9 +1922,14 @@ void DoSharingTemplates() {
         fNumGridRend->SetNumber(grend);
         SetCheckState(fChkGridX, gax > 0.5);
     }
+    fNumNPad->SetNumber((int)npad);
+    fNumMargin->SetNumber(marg);
+    DoArrayChange();
+    UpdatePosLimits();
     DoTrenchToggle();
     DoGridToggle();
     std::cout << ">>> Cache params loaded: PP=" << (int)pp << " Rsh=" << rsh
+              << " Array=" << (int)npad << "x" << (int)npad << " margin=" << marg
               << (isTrench ? " Trench" : Form(" RsP=%.0f RsM=%.0f gap=%.1f gapP=%.1f", rsp, rsm, gap, gapp))
               << (isGrid ? Form(" Grid offset=%.1f (%s) Rend=%.1f", goff, gax > 0.5 ? "x" : "y", grend) : "")
               << " Rin=" << rin << " Rpad=" << rpad << std::endl;
@@ -1800,6 +1952,8 @@ void DoSharingTemplates() {
     std::ofstream f(fCfgFile->GetText());
     if (!f) { std::cout << "ERROR: cannot write " << fCfgFile->GetText() << std::endl; return; }
     f << "PP="          << fNumPixelPitch->GetNumber()  << "\n";
+    f << "NPad="        << fNPad                        << "\n";
+    f << "Margin="      << fMargin                      << "\n";
     f << "Rsheet="      << fNumRsheet->GetNumber()      << "\n";
     f << "RStripPad="   << fNumRStripPad->GetNumber()   << "\n";
     f << "RStripMid="   << fNumRStripMid->GetNumber()   << "\n";
@@ -1836,6 +1990,8 @@ void DoSharingTemplates() {
         std::string name = key.substr(0, eq);
         val = std::stod(key.substr(eq + 1));
         if      (name == "PP")          fNumPixelPitch->SetNumber((int)val);
+        else if (name == "NPad")        fNumNPad->SetNumber((int)val);
+        else if (name == "Margin")      fNumMargin->SetNumber(val);
         else if (name == "Rsheet")      fNumRsheet->SetNumber(val);
         else if (name == "RStripPad")   fNumRStripPad->SetNumber(val);
         else if (name == "RStripMid")   fNumRStripMid->SetNumber(val);
@@ -1864,6 +2020,8 @@ void DoSharingTemplates() {
         std::cout << "WARNING: strip grid conflicts with trench / no-structure; grid disabled" << std::endl;
         fChkGrid->SetState(kButtonUp);
     }
+    DoArrayChange();   // no-op if the pad array is unchanged
+    UpdatePosLimits();
     DoTrenchToggle();  // sync enabled/disabled state of strip fields
     DoGridToggle();
     std::cout << ">>> Config loaded from " << fCfgFile->GetText() << std::endl;
@@ -1877,12 +2035,12 @@ void DoSharingTemplates() {
     int nbinx = fTemplates[0]->GetNbinsX();
     int nbiny = fTemplates[0]->GetNbinsY();
 
-    // Template axes are in [0, PP] (shifted from absolute [PP, 2PP])
+    // Template axes are in [0, PP] (shifted from absolute [CLo, CHi])
     int lowlim = 0;
     int uplim  = (int)PP();
 
-    // Electrode order: pIDs={7,11,6,10} → [0]=E7(top-left), [1]=E11(top-right),
-    //                                      [2]=E6(bottom-left), [3]=E10(bottom-right)
+    // Electrode order: pIDs={TL,TR,BL,BR} (4x4: {7,11,6,10}) → [0]=top-left, [1]=top-right,
+    //                                                        [2]=bottom-left, [3]=bottom-right
     // Output order matching ChRSD[pix][0..3] (ch0,ch1,ch2,ch3): fT[0],fT[1],fT[3],fT[2]
     int outIdx[4] = {0, 1, 3, 2};
 
@@ -1899,6 +2057,7 @@ void DoSharingTemplates() {
             PP(), fNumRsheet->GetNumber(), fNumRStripPad->GetNumber(),
             fNumRStripMid->GetNumber(), fNumStripGap->GetNumber(),
             fNumStripGapPad->GetNumber(), fNumRin->GetNumber(), PadRadius());
+    key += ArrayKey();
     double ampOff = fNumAmpOffset->GetNumber();
     TString fname = TString("DCRSD_Template_") + key
                     + TString::Format("_off%.3f", ampOff) + ".txt";
@@ -1928,6 +2087,7 @@ void DoSharingTemplates() {
     }
 
     TDecompSparse *solver = GetSolver(false);
+    if (!EnsureWeightFields(solver, false)) { SetStatus("  Ready  ", false); return; }
     TRandom3 rand(0);
     double noise = fNumNoise->GetNumber();
     
@@ -1962,25 +2122,21 @@ void DoSharingTemplates() {
 
     int nSkippedReco = 0;
     for (int ev = 0; ev < nEvents; ev++) {
-        double x_true = PP() + rand.Rndm() * PP();
-        double y_true = PP() + rand.Rndm() * PP();
+        double x_true = CLo() + rand.Rndm() * PP();
+        double y_true = CLo() + rand.Rndm() * PP();
 
         int ii = std::max(0, std::min(n-1, TMath::Nint(x_true/Pitch())));
         int jj = std::max(0, std::min(n-1, TMath::Nint(y_true/Pitch())));
         if (fTypeMap[ii*n + jj] > 0) { nSkippedReco++; continue; }
 
-        TVectorD B(nTot); B.Zero();
-        double padDirect[17] = {0};
-        InjectBilinear(B, x_true, y_true, padDirect);
-        bool ok; TVectorD V = solver->Solve(B, ok);
+        // Bilinear unit injection, read from the weighting fields (role order)
+        double c4[4];
+        CentralBilinear(x_true, y_true, c4);
 
-        std::vector<double> cur(17, 0.0); double iTot = 0;
-        CollectCurrents(V, cur, iTot);
-        for (int k = 1; k <= 16; k++) { cur[k] += padDirect[k]; iTot += padDirect[k]; }
-
-        int pIDs[4] = {7, 11, 6, 10};
+        int pRole[4] = { kTL, kTR, kBL, kBR };   // template order: pads TL, TR, BL, BR
         double ampOffset = fNumAmpOffset->GetNumber() / Amplitude();
-        for(int p=0; p<4; p++) cur[pIDs[p]] += ampOffset;
+        double cur[4];
+        for(int p=0; p<4; p++) cur[p] = c4[pRole[p]] + ampOffset;
         double L = fChkLandau->IsOn() ? rand.Landau(1.0, 0.3) : 1.0;
         double amp = Amplitude();
         double A_noisy[4];
@@ -1991,7 +2147,7 @@ void DoSharingTemplates() {
             // neighboring pads) correctly yields a smaller absolute signal
             // here, against the same fixed-RMS noise, degrading SNR as it
             // physically should.
-            A_noisy[p] = amp * cur[pIDs[p]] + rand.Gaus(0, noise) / L;
+            A_noisy[p] = amp * cur[p] + rand.Gaus(0, noise) / L;
             sum_noisy += A_noisy[p];
         }
 
@@ -2048,18 +2204,18 @@ void DoSharingTemplates() {
         double x_rec = fTemplates[0]->GetXaxis()->GetBinCenter(bx_best) + dx * bw_x;
         double y_rec = fTemplates[0]->GetYaxis()->GetBinCenter(by_best) + dy * bw_y;
 
-        // x_rec/y_rec in [0,PP] (shifted templates); x_true/y_true in [PP,2PP]
+        // x_rec/y_rec in [0,PP] (shifted templates); x_true/y_true in [CLo,CHi]
         // Constant term: smear the reference position to simulate telescope misalignment.
         // Total resolution in quadrature: σ_tot² = σ_intrinsic² + σ_const²
         double sigma_ct = fNumConstTerm->GetNumber();
         double ref_smear_x = (sigma_ct > 0) ? rand.Gaus(0, sigma_ct) : 0.0;
         double ref_smear_y = (sigma_ct > 0) ? rand.Gaus(0, sigma_ct) : 0.0;
-        double errX = x_rec - (x_true - PP()) - ref_smear_x;
-        double errY = y_rec - (y_true - PP()) - ref_smear_y;
-        hSumE2->Fill(x_true - PP(), y_true - PP(), errX*errX);
-        hCnt->Fill(x_true - PP(), y_true - PP());
+        double errX = x_rec - (x_true - CLo()) - ref_smear_x;
+        double errY = y_rec - (y_true - CLo()) - ref_smear_y;
+        hSumE2->Fill(x_true - CLo(), y_true - CLo(), errX*errX);
+        hCnt->Fill(x_true - CLo(), y_true - CLo());
         hErrX->Fill(errX);
-        gLin->SetPoint(gLin->GetN(), x_true - PP(), x_rec);
+        gLin->SetPoint(gLin->GetN(), x_true - CLo(), x_rec);
         hRecMap->Fill(x_rec, y_rec);
 
         if (ev % 500 == 0) std::cout << "Processed " << ev << " / " << nEvents << " events..." << std::endl;
@@ -2181,24 +2337,20 @@ void DoResistanceMatrix() {
     SetStatus("  Computing...  ", true);
     std::cout << "\n>>> Computing inter-electrode resistance (2-terminal, all others floating)..." << std::endl;
 
-    // Pure 2-terminal measurement: inject 1A into P11, ground only the sink pad.
-    // All other 14 pads floating. R = V(P11) - V(sink).
-    // Pairs: P11(2,2) <-> P7(1,2) [side], P11(2,2) <-> P6(1,1) [diagonal]
+    // Pure 2-terminal measurement: inject 1A into TR, ground only the sink pad.
+    // All other pads floating. R = V(TR) - V(sink).
+    // Pairs: TR <-> TL [side], TR <-> BL [diagonal]  (4x4: P11<->P7, P11<->P6)
 
     const int di[] = {1,-1,0,0}, dj[] = {0,0,1,-1};
 
-    auto padNode = [&](int r, int c) {
-        int pi = std::max(0, std::min(n-1, TMath::Nint(r * PP() / Pitch())));
-        int pj = std::max(0, std::min(n-1, TMath::Nint(c * PP() / Pitch())));
-        return pi*n + pj;
-    };
-
-    int nodeP11 = padNode(2, 2);
-    int nodeP7  = padNode(1, 2);  // side neighbor
-    int nodeP6  = padNode(1, 1);  // diagonal neighbor
+    const int idTR = fCentral[kTR], idTL = fCentral[kTL], idBL = fCentral[kBL];
+    int nodeP11 = PadCenterNode(idTR);
+    int nodeP7  = PadCenterNode(idTL);  // side neighbor
+    int nodeP6  = PadCenterNode(idBL);  // diagonal neighbor
 
     // Free KCL matrix: no special pad treatment, all nodes follow pure KCL
     TMatrixDSparse Mfree(nTot, nTot);
+    Triplets T; T.reserve(5*(size_t)nTot);
     for (int i = 0; i < n; i++) {
         for (int j = 0; j < n; j++) {
             int idx = i*n + j;
@@ -2208,12 +2360,13 @@ void DoResistanceMatrix() {
                 if (ni2>=0 && ni2<n && nj2>=0 && nj2<n) {
                     double cond = GetEdgeConductance(i, j, di[kk], dj[kk]);
                     sum_g += cond;
-                    Mfree(idx, ni2*n+nj2) = -cond;
+                    T.add(idx, ni2*n+nj2, -cond);
                 }
             }
-            Mfree(idx, idx) = sum_g;
+            T.add(idx, idx, sum_g);
         }
     }
+    T.fill(Mfree);
 
     // Kelvin measurement: inject +1A into P11, extract -1A at sink.
     // System is non-singular thanks to a weak voltage reference (1 nS) at a corner node.
@@ -2229,7 +2382,7 @@ void DoResistanceMatrix() {
         TVectorD B(nTot); B.Zero(); B(nodeP11) = +1.0; B(nodeP7) = -1.0;
         bool ok; TVectorD V = sol.Solve(B, ok);
         R_side = V(nodeP11) - V(nodeP7);
-        printf("  R_side  P11(2,2) <-> P7(1,2)  = %.1f Ohm\n", R_side);
+        printf("  R_side  P%d <-> P%d  = %.1f Ohm\n", idTR, idTL, R_side);
     }
 
     // --- R_diag: P11 ↔ P6 ---
@@ -2240,7 +2393,7 @@ void DoResistanceMatrix() {
         TVectorD B(nTot); B.Zero(); B(nodeP11) = +1.0; B(nodeP6) = -1.0;
         bool ok; TVectorD V = sol.Solve(B, ok);
         R_diag = V(nodeP11) - V(nodeP6);
-        printf("  R_diag  P11(2,2) <-> P6(1,1)  = %.1f Ohm\n", R_diag);
+        printf("  R_diag  P%d <-> P%d  = %.1f Ohm\n", idTR, idBL, R_diag);
     }
 
     // Bar chart
@@ -2251,8 +2404,8 @@ void DoResistanceMatrix() {
         Form("Inter-electrode Resistance [#Omega]  (PP=%.0f #mum, R_{sh}=%.0f, R_{sP}=%.0f, R_{sM}=%.0f);Pair;R [#Omega]",
              PP(), fNumRsheet->GetNumber(), fNumRStripPad->GetNumber(), fNumRStripMid->GetNumber()),
         2, 0, 2);
-    hRvec->GetXaxis()->SetBinLabel(1, "R_{side}  P11#leftrightarrowP7");
-    hRvec->GetXaxis()->SetBinLabel(2, "R_{diag}  P11#leftrightarrowP6");
+    hRvec->GetXaxis()->SetBinLabel(1, Form("R_{side}  P%d#leftrightarrowP%d", idTR, idTL));
+    hRvec->GetXaxis()->SetBinLabel(2, Form("R_{diag}  P%d#leftrightarrowP%d", idTR, idBL));
     hRvec->SetBinContent(1, R_side);
     hRvec->SetBinContent(2, R_diag);
     hRvec->SetFillColor(kAzure+1);
