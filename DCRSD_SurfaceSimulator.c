@@ -26,6 +26,7 @@
 #include <vector>
 #include <algorithm>
 #include <queue> 
+#include <chrono>
 
 // Physical Constants
 const double eps0 = 8.854e-12; // F/m
@@ -40,7 +41,7 @@ private:
     TGNumberEntry       *fNumX, *fNumY, *fNumRsheet, *fNumThick, *fNumDur;
     TGNumberEntry       *fNumRStripPad, *fNumRStripMid, *fNumStripGap, *fNumStripGapPad, *fNumPixelPitch;
     TGNumberEntry       *fNumAmplitude;
-    TGNumberEntry       *fNumNoise, *fNumAmpOffset, *fNumConstTerm, *fNumScanStep, *fNumThreshold, *fNumRecoEvents;
+    TGNumberEntry       *fNumNoise, *fNumAmpOffset, *fNumConstTerm, *fNumScanStep, *fNumThreshold, *fNumRecoEvents, *fNumMapBins;
     TGNumberEntry       *fNumRin;
     TGNumberEntry       *fNumPadRadius;
     TGNumberEntry       *fNumNPad = nullptr, *fNumMargin = nullptr;
@@ -49,6 +50,8 @@ private:
     TGCheckButton       *fChkNoStruct = nullptr;
     TGCheckButton       *fChkGrid    = nullptr;
     TGCheckButton       *fChkGridX  = nullptr;
+    TGCheckButton       *fChkElbow  = nullptr;
+    TGNumberEntry       *fNumStripWidth = nullptr;
     TGNumberEntry       *fNumGridOffset = nullptr, *fNumGridRend = nullptr;
     bool                 fGridLocked = false;   // grid mode has disabled trench/no-structure/gap controls
     TGCheckButton       *fChkLandau = nullptr;
@@ -77,6 +80,7 @@ private:
         nTot = n * n;
         fTypeMap.assign(nTot, 0);
         fPadOwnerMap.assign(nTot, 0);
+        fTypeMapGridKey = "(resized)";   // force BuildTypeMaps (and the elbow maps) on the next GetSolver
     }
     // Straight strips run only between the outer pad lines (with fMargin > 0 the
     // margin is bulk only; with fMargin = 0 this is the whole domain, as before)
@@ -215,7 +219,7 @@ private:
         TString geomKey;
         if (TrenchEnabled())
             geomKey = TString::Format("PP%.0f_Rsh%.0f_tr1_Rin%.2f_Rpad%.0f", PP(), rsh, rin, rpad);
-        else if (GridEnabled())
+        else if (!GridKey().IsNull())
             geomKey = TString::Format("PP%.0f_Rsh%.0f_RsP%.0f_RsM%.0f_%s_tr0_Rin%.2f_Rpad%.0f",
                 PP(), rsh, fNumRStripPad->GetNumber(), fNumRStripMid->GetNumber(),
                 GridKey().Data(), rin, rpad);
@@ -278,6 +282,13 @@ private:
 
     std::vector<int> fTypeMap;
     std::vector<int> fPadOwnerMap;
+
+    // Elbow strips, thin-wire model (rebuilt in BuildElbowMaps)
+    std::vector<double> fWireGx, fWireGy;  // extra conductance of edge (i,j)->(i+1,j) / (i,j)->(i,j+1)
+    std::vector<double> fWireRs;           // strip R_s at wire nodes (0 = no wire); display + propagation
+    std::vector<int>    fEndCount;         // grounded strip ends per node
+    std::vector<int>    fStripOfNode;      // strip id incl. 1-node halo, -1 = none (propagation)
+    std::vector<int>    fStripOfPad;       // strip id per pad ID, -1 = none
     TString          fTypeMapGridKey;   // GridKey() the type maps were last built with
 
     TH2D *fTemplates[4] = {};
@@ -347,8 +358,9 @@ public:
         fNumPadRadius = new TGNumberEntry(vCol1, 30, 6, -1, TGNumberFormat::kNESRealOne, TGNumberFormat::kNEAPositive, TGNumberFormat::kNELLimitMinMax, 1, 500);
         vCol1->AddFrame(fNumPadRadius, entL);
 
-        vCol1->AddFrame(new TGLabel(vCol1, "# bins per pixel:"), lblL);
-        fNumScanStep = new TGNumberEntry(vCol1, 50, 6, -1, TGNumberFormat::kNESInteger, TGNumberFormat::kNEAPositive, TGNumberFormat::kNELLimitMinMax, 5, 200);
+        // Scans read the nearest mesh node, so more bins than mesh nodes (100 per pixel) add no detail
+        vCol1->AddFrame(new TGLabel(vCol1, "# bins per pixel (max 100 = mesh):"), lblL);
+        fNumScanStep = new TGNumberEntry(vCol1, 100, 6, -1, TGNumberFormat::kNESInteger, TGNumberFormat::kNEAPositive, TGNumberFormat::kNELLimitMinMax, 5, kNodesPerPitch);
         vCol1->AddFrame(fNumScanStep, entL);
 
         vCol1->AddFrame(new TGLabel(vCol1, "Surface Resistivity [Ohm/sq]:"), lblL);
@@ -405,6 +417,18 @@ public:
         fNumGridRend = new TGNumberEntry(hGridN, 500, 6, -1, TGNumberFormat::kNESRealOne, TGNumberFormat::kNEAPositive, TGNumberFormat::kNELLimitMinMax, 1, 1e9);
         hGridN->AddFrame(fNumGridRend, gridL);
         vCol2->AddFrame(hGridN, entL);
+
+        // Elbow strips: nested L-shaped strips per quadrant, each running to the edge.
+        // Shares the strip-end R to GND above; needs an even number of pads per side.
+        fChkElbow = new TGCheckButton(vCol2, "Elbow strips (L rings to edge)");
+        vCol2->AddFrame(fChkElbow, new TGLayoutHints(kLHintsLeft | kLHintsTop, 20, 5, 4, 5));
+        fChkElbow->Connect("Toggled(Bool_t)", "RSDStripPanel", this, "DoGridToggle()");
+
+        vCol2->AddFrame(new TGLabel(vCol2, "Strip width [um]:"), lblL);
+        fNumStripWidth = new TGNumberEntry(vCol2, 10, 6, -1, TGNumberFormat::kNESRealOne,
+            TGNumberFormat::kNEAPositive, TGNumberFormat::kNELLimitMinMax, 1, 200);
+        vCol2->AddFrame(fNumStripWidth, entL);
+        fNumStripWidth->Connect("ValueSet(Long_t)", "RSDStripPanel", this, "UpdateStripRLabel()");
 
         fLblStripR = new TGLabel(vCol2, "Total R_strip: 9999.9 kOhm");
         vCol2->AddFrame(fLblStripR, entL);
@@ -529,8 +553,13 @@ public:
         btnReco->SetBackgroundColor(0xccffcc);
 
         vCol3->AddFrame(new TGLabel(vCol3, "N events for Template Reco:"), lblL);
-        fNumRecoEvents = new TGNumberEntry(vCol3, 5000, 6, -1, TGNumberFormat::kNESInteger, TGNumberFormat::kNEAPositive, TGNumberFormat::kNELLimitMinMax, 100, 100000);
+        fNumRecoEvents = new TGNumberEntry(vCol3, 50000, 7, -1, TGNumberFormat::kNESInteger, TGNumberFormat::kNEAPositive, TGNumberFormat::kNELLimitMinMax, 100, 1000000);
         vCol3->AddFrame(fNumRecoEvents, entL);
+
+        // Bins per side of the RMS resolution maps; each bin needs ~20 events for a stable RMS
+        vCol3->AddFrame(new TGLabel(vCol3, "Resolution map bins:"), lblL);
+        fNumMapBins = new TGNumberEntry(vCol3, 50, 6, -1, TGNumberFormat::kNESInteger, TGNumberFormat::kNEAPositive, TGNumberFormat::kNELLimitMinMax, 5, kNodesPerPitch);
+        vCol3->AddFrame(fNumMapBins, entL);
 
         BoldHead(vCol3, "--- Cache ---");
         TGTextButton *btnLoadCache = new TGTextButton(vCol3, "Load params from cache file");
@@ -632,6 +661,85 @@ public:
                 if (is_s) fPadOwnerMap[idx] = closest_pad;
             }
         }
+        BuildElbowMaps(pp);
+    }
+
+    // Elbow strips, thin-wire model. In each quadrant, ring k (k = 0..N/2-1) is an L
+    // with its elbow at pad (corner + k, corner + k) and one arm per direction running
+    // to the domain edge through the k pads on that arm; ring 0 is a diagonal lead from
+    // the corner pad to the domain corner. Each strip adds w / (R_s * h) to the edges
+    // on its centreline only, so the width enters exactly, independent of the mesh.
+    // Strip ends at the boundary drain to GND through R_end.
+    void BuildElbowMaps(double pp) {
+        fWireGx.assign(nTot, 0.0); fWireGy.assign(nTot, 0.0); fWireRs.assign(nTot, 0.0);
+        fEndCount.assign(nTot, 0); fStripOfNode.assign(nTot, -1); fStripOfPad.assign(NPads()+1, -1);
+        if (!ElbowEnabled()) return;
+        if (fNPad % 2) { std::cout << "WARNING: elbow layout needs an even number of pads per side" << std::endl; return; }
+
+        const double h   = pp / kNodesPerPitch;              // node spacing [um]
+        const double w   = fNumStripWidth->GetNumber();      // strip width  [um]
+        const double RsP = fNumRStripPad->GetNumber(), RsM = fNumRStripMid->GetNumber();
+        auto nodeOf = [&](int k) { return (int)std::lround((k + fMargin) * kNodesPerPitch); };
+        int sid = 0;
+
+        for (int q = 0; q < 4; q++) {
+            const int sx = (q & 1) ? -1 : +1, sy = (q & 2) ? -1 : +1;           // direction rings grow
+            const int cx = (sx > 0) ? 0 : fNPad-1, cy = (sy > 0) ? 0 : fNPad-1;  // corner pad
+            const int ex = (sx > 0) ? 0 : n-1,     ey = (sy > 0) ? 0 : n-1;      // its two edges (node idx)
+
+            for (int k = 0; k < fNPad/2; k++, sid++) {
+                // Pads on ring k: the elbow, plus k on each arm
+                std::vector<std::pair<int,int>> pads = {{cx + sx*k, cy + sy*k}};
+                for (int t = 0; t < k; t++) {
+                    pads.push_back({cx + sx*t, cy + sy*k});   // on the x-directed arm
+                    pads.push_back({cx + sx*k, cy + sy*t});   // on the y-directed arm
+                }
+                for (auto &pd : pads) fStripOfPad[PadID(pd.first, pd.second)] = sid;
+
+                // Conductance of one wire edge, midpoint (xm, ym) in node units. R_s follows
+                // the R_sP -> R_sM profile, "along" measured to the nearest pad on this strip
+                auto gWire = [&](double xm, double ym, double lenFactor) {
+                    double along = 1e9;
+                    for (auto &pd : pads)
+                        along = std::min(along, h * TMath::Hypot(xm - nodeOf(pd.first), ym - nodeOf(pd.second)));
+                    along = std::min(along, pp/2.0);
+                    double Rs = RsP + (RsM - RsP) * (2.0*along/pp);
+                    return std::make_pair(lenFactor * w / (Rs * h), Rs);
+                };
+                // Wire node + 1-node halo, so 8-connected propagation can't hop across the wire
+                auto mark = [&](int i, int j, double Rs) {
+                    fWireRs[i*n+j] = Rs;
+                    for (int a = -1; a <= 1; a++) for (int b = -1; b <= 1; b++) {
+                        int ii = i+a, jj = j+b;
+                        if (ii >= 0 && ii < n && jj >= 0 && jj < n) fStripOfNode[ii*n+jj] = sid;
+                    }
+                };
+                auto xEdge = [&](int i, int j, double f) {   // edge (i,j)->(i+1,j)
+                    auto g = gWire(i + 0.5, j, f);
+                    fWireGx[i*n+j] += g.first; mark(i, j, g.second); mark(i+1, j, g.second);
+                };
+                auto yEdge = [&](int i, int j, double f) {   // edge (i,j)->(i,j+1)
+                    auto g = gWire(i, j + 0.5, f);
+                    fWireGy[i*n+j] += g.first; mark(i, j, g.second); mark(i, j+1, g.second);
+                };
+
+                const int ie = nodeOf(cx + sx*k), je = nodeOf(cy + sy*k);   // elbow node
+                if (k == 0) {
+                    // Corner lead: staircase from pad to corner; sqrt(2) restores the true length
+                    int i = ie, j = je;
+                    while (i != ex || j != ey) {
+                        if (i != ex) { int i2 = i - sx; xEdge(std::min(i, i2), j, M_SQRT2); i = i2; }
+                        if (j != ey) { int j2 = j - sy; yEdge(i, std::min(j, j2), M_SQRT2); j = j2; }
+                    }
+                    fEndCount[ex*n + ey]++;
+                } else {
+                    for (int i = std::min(ex, ie); i < std::max(ex, ie); i++) xEdge(i, je, 1.0);  // arm to x-edge
+                    for (int j = std::min(ey, je); j < std::max(ey, je); j++) yEdge(ie, j, 1.0);  // arm to y-edge
+                    fEndCount[ex*n + je]++;
+                    fEndCount[ie*n + ey]++;
+                }
+            }
+        }
     }
 
     bool TrenchEnabled() { return fChkTrench && fChkTrench->IsOn(); }
@@ -640,9 +748,15 @@ public:
     bool GridEnabled() { return fChkGrid && fChkGrid->IsOn() && !TrenchEnabled(); }
     // A disabled TGCheckButton reports IsOn()==false; this reads the remembered choice
     bool GridShiftX() { return fChkGridX->IsOn() || fChkGridX->IsDisabledAndSelected(); }
+    bool ElbowEnabled() { return fChkElbow && fChkElbow->IsOn() && !TrenchEnabled() && !GridEnabled(); }
+    // Grounded strip ends at node (i,j), for whichever strip mode is active
+    int  StripEnds(int i, int j) { return ElbowEnabled() ? fEndCount[i*n+j] : GridStripEnds(i, j); }
 
-    // Geometry tag for cache keys; empty when grid mode is off
+    // Geometry tag for cache keys; empty when neither grid nor elbow mode is on
     TString GridKey() {
+        if (ElbowEnabled())
+            return TString::Format("elbow1_w%.1f_Rend%.1f",
+                                   fNumStripWidth->GetNumber(), fNumGridRend->GetNumber());
         if (!GridEnabled()) return "";
         return TString::Format("grid1_off%.1f_ax%d_Rend%.1f",
             fNumGridOffset->GetNumber(), GridShiftX() ? 1 : 0, fNumGridRend->GetNumber());
@@ -704,15 +818,18 @@ public:
     void UpdateGridControls() {
         if (!fChkGrid) return;
         bool ns = fChkNoStruct->IsOn();
-        SetCheckEnabled(fChkGrid, !ns && !TrenchEnabled());
+        bool elbow = ElbowEnabled();
+        SetCheckEnabled(fChkGrid,  !ns && !TrenchEnabled() && !elbow);
+        SetCheckEnabled(fChkElbow, !ns && !TrenchEnabled() && !GridEnabled());
         bool grid = GridEnabled();
         SetCheckEnabled(fChkGridX, grid);
         fNumGridOffset->SetState(grid);
-        fNumGridRend->SetState(grid);
-        if (grid) {
+        fNumGridRend->SetState(grid || elbow);
+        fNumStripWidth->SetState(elbow);
+        if (grid || elbow) {
             SetCheckEnabled(fChkTrench, false);
             SetCheckEnabled(fChkNoStruct, false);
-            fNumStripGap->SetState(false);      // straight-strip gaps don't apply to the grid
+            fNumStripGap->SetState(false);      // straight-strip gaps don't apply to grid / elbow
             fNumStripGapPad->SetState(false);
             fGridLocked = true;
         }
@@ -807,7 +924,7 @@ public:
     }
 
     void DoGridToggle() {
-        if (!GridEnabled() && fGridLocked) {
+        if (!GridEnabled() && !ElbowEnabled() && fGridLocked) {
             // Release what grid mode locked
             fGridLocked = false;
             SetCheckEnabled(fChkNoStruct, true);
@@ -832,10 +949,12 @@ public:
         const char *what = "Total R_strip";
         double R_tot;
         if (GridEnabled()) what = "R_strip crossing->crossing";
+        if (ElbowEnabled()) what = "R_strip pad->pad";
         {
-            // Strip width = 2 * (PP*0.025) from GetEdgeConductance threshold
-            double strip_width = 2.0 * 0.025 * pp;   // = 0.05 * pp  (always 20 sq pad-to-pad)
-            double N_sq        = pp / strip_width;    // = 20, independent of PP
+            // Straight / grid: width = 2 * (PP*0.025) from the GetEdgeConductance band
+            // (always 20 sq pad-to-pad); elbow: the strip width entry
+            double strip_width = ElbowEnabled() ? fNumStripWidth->GetNumber() : 2.0 * 0.025 * pp;
+            double N_sq        = pp / strip_width;
             // Resistance: N_sq/2 squares per half, average resistivity (R_sP+R_sM)/2
             R_tot              = (N_sq / 2.0) * (R_sP + R_sM);
         }
@@ -898,6 +1017,13 @@ public:
         // With trench active, strips have no effect (only bulk)
         if (TrenchEnabled()) return 1.0/R_bulk;
 
+        // Elbow strips: bulk plus the wire conductance stored for this edge (if any)
+        if (ElbowEnabled()) {
+            double gw = (di != 0) ? fWireGx[std::min(i, i+di)*n + j]
+                                  : fWireGy[i*n + std::min(j, j+dj)];
+            return 1.0/R_bulk + gw;
+        }
+
         // Strip grid replaces the straight strips. dj==0: x-directed edge, on an
         // x-directed strip if within 0.025*PP of one (same width as the straight strips)
         if (GridEnabled()) {
@@ -956,6 +1082,12 @@ public:
     }
 
     double GetLocalResistance(double x, double y) {
+        if (ElbowEnabled()) {
+            int i = std::clamp((int)std::lround(x/Pitch()), 0, n-1);
+            int j = std::clamp((int)std::lround(y/Pitch()), 0, n-1);
+            double rs = fWireRs[i*n+j];
+            return rs > 0 ? rs : fNumRsheet->GetNumber();
+        }
         if (GridEnabled()) {
             double dx = GridLineDist(x, GridShift(0)), dy = GridLineDist(y, GridShift(1));
             const double hw = PP()*0.025;
@@ -1056,7 +1188,9 @@ public:
                         int strip_owner = fPadOwnerMap[v];
                         
                         bool is_foreign_pad = (pad_at_v > 0 && pad_at_v != targetID);
-                        bool is_foreign_strip = (strip_owner > 0 && strip_owner != targetID);
+                        bool is_foreign_strip = ElbowEnabled()
+                            ? (fStripOfNode[v] >= 0 && fStripOfNode[v] != fStripOfPad[targetID])
+                            : (strip_owner > 0 && strip_owner != targetID);
                         
                         if ((is_foreign_pad || is_foreign_strip) && v != startNode) {
                             continue; 
@@ -1139,6 +1273,7 @@ public:
             if (fSolverStatic && fMatrixStatic && R_sh==fLastRsheetStat && R_sP==fLastRStripPStat && R_sM==fLastRStripMStat && gap==fLastGapStat && gap_pad==fLastGapPadStat && pp==fLastPPStat && trench==fLastTrenchStat && rin==fLastRinStat && pad_r==fLastPadRadiusStat && gridKey==fLastGridKeyStat) return fSolverStatic;
             if (fSolverStatic) delete fSolverStatic; if (fMatrixStatic) delete fMatrixStatic;
             fMatrixStatic = nullptr;
+            BuildElbowMaps(pp);   // wire conductances also depend on R_sP/R_sM, which GridKey doesn't carry
             // --- On-disk cache ---
             // Same node count can come from different arrays (4x4 margin 0.5 and 5x5
             // margin 0 both give n = 401), so the array is part of the directory and key
@@ -1148,7 +1283,7 @@ public:
             if (trench)
                 cacheDir = ppDir + "/trench";
             else if (!gridKey.IsNull())
-                cacheDir = ppDir + TString::Format("/grid_RsP%.0f_RsM%.0f", R_sP, R_sM);
+                cacheDir = ppDir + TString::Format(ElbowEnabled() ? "/elbow1_RsP%.0f_RsM%.0f" : "/grid_RsP%.0f_RsM%.0f", R_sP, R_sM);
             else
                 cacheDir = ppDir + TString::Format("/RsP%.0f_RsM%.0f", R_sP, R_sM);
             gSystem->mkdir(cacheDir.Data(), kTRUE);
@@ -1202,6 +1337,7 @@ public:
             if (gridKey != fTypeMapGridKey) BuildTypeMaps(pp, PadRadius());
             if (fSolverTrans && fMatrixTrans && R_sh==fLastRsheetTrans && R_sP==fLastRStripPTrans && R_sM==fLastRStripMTrans && th==fLastThickTrans && gap==fLastGapTrans && pp==fLastPPTrans && dt==fLastDtTrans && C_node==fLastCnodeTrans && trench==fLastTrenchTrans && rin==fLastRinTrans && gridKey==fLastGridKeyTrans) return fSolverTrans;
             if (fSolverTrans) delete fSolverTrans; if (fMatrixTrans) delete fMatrixTrans;
+            BuildElbowMaps(pp);
             fMatrixTrans = new TMatrixDSparse(nTot, nTot); BuildMatrix(*fMatrixTrans, true, C_node/dt);
             fSolverTrans = new TDecompSparse(); fSolverTrans->SetMatrix(*fMatrixTrans); fSolverTrans->Decompose();
             fLastRsheetTrans = R_sh; fLastRStripPTrans = R_sP; fLastRStripMTrans = R_sM; fLastThickTrans = th; fLastGapTrans = gap; fLastPPTrans = pp; fLastDtTrans = dt; fLastCnodeTrans = C_node; fLastTrenchTrans = trench; fLastRinTrans = rin; fLastGridKeyTrans = gridKey;
@@ -1220,13 +1356,31 @@ public:
         void fill(TMatrixDSparse &M) { M.SetMatrixArray((Int_t)val.size(), row.data(), col.data(), val.data()); }
     };
 
+    // Resistivity shown in the maps at node (i,j). Display only: elbow wires are one
+    // mesh node wide and vanish when ROOT draws more bins than the pad has pixels, so
+    // any node within 2 nodes of a wire shows that wire's R_s (25 um wide on screen).
+    double DisplayResistance(int i, int j) {
+        if (ElbowEnabled() && fWireRs[i*n+j] <= 0) {
+            double rw = 0;
+            for (int a = -2; a <= 2; a++)
+                for (int b = -2; b <= 2; b++) {
+                    int ii = i + a, jj = j + b;
+                    if (ii < 0 || ii >= n || jj < 0 || jj >= n) continue;
+                    double r = fWireRs[ii*n+jj];
+                    if (r > 0 && (rw == 0 || r < rw)) rw = r;
+                }
+            if (rw > 0) return rw;
+        }
+        return GetLocalResistance(i*Pitch(), j*Pitch());
+    }
+
     void BuildMatrix(TMatrixDSparse &M, bool transient, double diagAdd) {
         double R_in = fNumRin->GetNumber();
         bool use_Rin = (R_in > 0);
         // Short-circuit conductance within metal pad (enforces equipotential)
         const double G_short = 1e6;
-        // Strip grid: strip ends drain to GND through R_end (diagonal only, keeps M symmetric)
-        const double G_end = GridEnabled() ? 1.0/fNumGridRend->GetNumber() : 0.0;
+        // Strip grid / elbow: strip ends drain to GND through R_end (diagonal only, keeps M symmetric)
+        const double G_end = (GridEnabled() || ElbowEnabled()) ? 1.0/fNumGridRend->GetNumber() : 0.0;
         const int di[] = {1,-1,0,0}, dj[] = {0,0,1,-1};
         Triplets T; T.reserve(5*(size_t)nTot);
         for (int i=0; i<n; i++) {
@@ -1242,7 +1396,7 @@ public:
                     double sum_g = diagAdd;
                     // Only the center node of this pad drains to GND via R_in
                     if (idx == PadCenterNode(pad_k)) sum_g += 1.0/R_in;
-                    if (G_end > 0) sum_g += G_end * GridStripEnds(i, j);
+                    if (G_end > 0) sum_g += G_end * StripEnds(i, j);
                     for (int k2=0; k2<4; k2++) {
                         int ni=i+di[k2], nj=j+dj[k2];
                         if (ni>=0&&ni<n&&nj>=0&&nj<n) {
@@ -1264,7 +1418,7 @@ public:
 
                 // Surface node: regular KCL
                 double sum_g = diagAdd;
-                if (G_end > 0) sum_g += G_end * GridStripEnds(i, j);
+                if (G_end > 0) sum_g += G_end * StripEnds(i, j);
                 for (int k2=0; k2<4; k2++) {
                     int ni=i+di[k2], nj=j+dj[k2];
                     if (ni>=0&&ni<n&&nj>=0&&nj<n) {
@@ -1294,7 +1448,7 @@ public:
         for (int i=0; i<n; i++)
             for (int j=0; j<n; j++) {
                 int idx = i*n+j;
-                hResGrid->SetBinContent(i+1, j+1, (fTypeMap[idx]>0) ? 0 : GetLocalResistance(i*Pitch(), j*Pitch()));
+                hResGrid->SetBinContent(i+1, j+1, (fTypeMap[idx]>0) ? 0 : DisplayResistance(i, j));
             }
         c->cd(1); gPad->SetLogz();
         hResGrid->Draw("COLZ");
@@ -1330,7 +1484,7 @@ void DoInjectCharge() {
     for (int i=0; i<n; i++) {
         for (int j=0; j<n; j++) {
             int idx = i*n+j;
-            double r_local = GetLocalResistance(i*Pitch(), j*Pitch());
+            double r_local = DisplayResistance(i, j);
             hRes->SetBinContent(i+1, j+1, (fTypeMap[idx]>0) ? 0 : r_local);
             hPot->SetBinContent(i+1, j+1, V(idx));
         }
@@ -1535,6 +1689,7 @@ void DoInjectCharge() {
 
         if (mode >= 2 && mode <= 3) gStyle->SetPalette(kTemperatureMap); else gStyle->SetPalette(kBird);
 
+        auto lastDraw = std::chrono::steady_clock::now();
         for (int ix = 0; ix < nBins; ix++) {
             double x = scanMin + ix * step;
             for (int iy = 0; iy < nBins; iy++) {
@@ -1566,7 +1721,11 @@ void DoInjectCharge() {
                     cntProjX[ix]++;
                 }
             }
-            if (ix % 2 == 0) {
+            // Progress redraw at most twice a second: repainting a large map every
+            // column would cost more than the scan itself
+            auto now = std::chrono::steady_clock::now();
+            if (now - lastDraw > std::chrono::milliseconds(500)) {
+                lastDraw = now;
                 cScan->cd(mode==0 ? 1 : 0); hScan->Draw("COLZ");
                 if (hLeak) { cScan->cd(2); hLeak->Draw("COLZ"); }
                 cScan->Update(); gSystem->ProcessEvents();
@@ -1642,7 +1801,7 @@ void DoInjectCharge() {
         delete gROOT->FindObject("hErrXMap");   delete gROOT->FindObject("hRes1D");
         delete gROOT->FindObject("gScatterX");  delete gROOT->FindObject("hSumE2Unb");
         delete gROOT->FindObject("hCntUnb");
-        const int nMapBins = 30;
+        const int nMapBins = (int)fNumMapBins->GetNumber();
         TH2D *hSumE2 = new TH2D("hSumE2Unb", "", nMapBins, 0, PP(), nMapBins, 0, PP());
         TH2D *hCnt   = new TH2D("hCntUnb",   "", nMapBins, 0, PP(), nMapBins, 0, PP());
         TH2D *hErrX  = new TH2D("hErrXMap",
@@ -1900,6 +2059,12 @@ void DoSharingTemplates() {
         std::cout << "ERROR: cannot parse grid parameters from cache filename: " << fn << std::endl;
         return;
     }
+    bool isElbow = !isTrench && fn.find("_elbow1") != std::string::npos;
+    double ewidth = fNumStripWidth->GetNumber();
+    if (isElbow && !(extract("_w", ewidth) && extract("_Rend", grend))) {
+        std::cout << "ERROR: cannot parse elbow parameters from cache filename: " << fn << std::endl;
+        return;
+    }
     // Pad array tag (absent = original 4x4, margin 0)
     double npad = 4, marg = 0;
     extract("_N", npad);
@@ -1922,6 +2087,11 @@ void DoSharingTemplates() {
         fNumGridRend->SetNumber(grend);
         SetCheckState(fChkGridX, gax > 0.5);
     }
+    SetCheckState(fChkElbow, isElbow);
+    if (isElbow) {
+        fNumStripWidth->SetNumber(ewidth);
+        fNumGridRend->SetNumber(grend);
+    }
     fNumNPad->SetNumber((int)npad);
     fNumMargin->SetNumber(marg);
     DoArrayChange();
@@ -1932,6 +2102,7 @@ void DoSharingTemplates() {
               << " Array=" << (int)npad << "x" << (int)npad << " margin=" << marg
               << (isTrench ? " Trench" : Form(" RsP=%.0f RsM=%.0f gap=%.1f gapP=%.1f", rsp, rsm, gap, gapp))
               << (isGrid ? Form(" Grid offset=%.1f (%s) Rend=%.1f", goff, gax > 0.5 ? "x" : "y", grend) : "")
+              << (isElbow ? Form(" Elbow width=%.1f Rend=%.1f", ewidth, grend) : "")
               << " Rin=" << rin << " Rpad=" << rpad << std::endl;
     DoCalculateGrid();
 }
@@ -1966,6 +2137,8 @@ void DoSharingTemplates() {
     f << "GridOffset="  << fNumGridOffset->GetNumber()  << "\n";
     f << "GridOffsetX=" << (GridShiftX() ? 1 : 0)       << "\n";
     f << "GridRend="    << fNumGridRend->GetNumber()    << "\n";
+    f << "Elbow="       << (ElbowEnabled() ? 1 : 0)     << "\n";
+    f << "StripWidth="  << fNumStripWidth->GetNumber()  << "\n";
     f << "Amplitude="   << fNumAmplitude->GetNumber()   << "\n";
     f << "Noise="       << fNumNoise->GetNumber()       << "\n";
     f << "AmpOffset="   << fNumAmpOffset->GetNumber()   << "\n";
@@ -1975,6 +2148,7 @@ void DoSharingTemplates() {
     f << "Thick="       << fNumThick->GetNumber()       << "\n";
     f << "Dur="         << fNumDur->GetNumber()         << "\n";
     f << "RecoEvents="  << fNumRecoEvents->GetNumber()  << "\n";
+    f << "MapBins="     << fNumMapBins->GetNumber()     << "\n";
     f << "Landau="      << (fChkLandau->IsOn() ? 1 : 0) << "\n";
     f.close();
     std::cout << ">>> Config saved to " << fCfgFile->GetText() << std::endl;
@@ -2004,21 +2178,28 @@ void DoSharingTemplates() {
         else if (name == "GridOffset")  fNumGridOffset->SetNumber(val);
         else if (name == "GridOffsetX") SetCheckState(fChkGridX, val);
         else if (name == "GridRend")    fNumGridRend->SetNumber(val);
+        else if (name == "Elbow")       SetCheckState(fChkElbow, val);
+        else if (name == "StripWidth")  fNumStripWidth->SetNumber(val);
         else if (name == "Amplitude")   fNumAmplitude->SetNumber(val);
         else if (name == "Noise")       fNumNoise->SetNumber(val);
         else if (name == "AmpOffset")   fNumAmpOffset->SetNumber(val);
         else if (name == "ConstTerm")   fNumConstTerm->SetNumber(val);
-        else if (name == "ScanStep")    fNumScanStep->SetNumber(val);
+        else if (name == "ScanStep")    fNumScanStep->SetNumber(std::min(val, (double)kNodesPerPitch));  // old configs allowed 200
         else if (name == "Threshold")   fNumThreshold->SetNumber(val);
         else if (name == "Thick")       fNumThick->SetNumber(val);
         else if (name == "Dur")         fNumDur->SetNumber(val);
         else if (name == "RecoEvents")  fNumRecoEvents->SetNumber((int)val);
+        else if (name == "MapBins")     fNumMapBins->SetNumber((int)val);
         else if (name == "Landau")      fChkLandau->SetState(val ? kButtonDown : kButtonUp);
     }
     f.close();
     if (fChkGrid->IsOn() && (fChkTrench->IsOn() || fChkNoStruct->IsOn())) {
         std::cout << "WARNING: strip grid conflicts with trench / no-structure; grid disabled" << std::endl;
         fChkGrid->SetState(kButtonUp);
+    }
+    if (fChkElbow->IsOn() && (fChkTrench->IsOn() || fChkNoStruct->IsOn() || fChkGrid->IsOn())) {
+        std::cout << "WARNING: elbow strips conflict with trench / no-structure / grid; elbow disabled" << std::endl;
+        fChkElbow->SetState(kButtonUp);
     }
     DoArrayChange();   // no-op if the pad array is unchanged
     UpdatePosLimits();
@@ -2048,7 +2229,7 @@ void DoSharingTemplates() {
     if (fChkTrench->IsOn())
         key = TString::Format("PP%.0f_Rsh%.0f_tr1_Rin%.2f_Rpad%.0f",
             PP(), fNumRsheet->GetNumber(), fNumRin->GetNumber(), PadRadius());
-    else if (GridEnabled())
+    else if (!GridKey().IsNull())
         key = TString::Format("PP%.0f_Rsh%.0f_RsP%.0f_RsM%.0f_%s_tr0_Rin%.2f_Rpad%.0f",
             PP(), fNumRsheet->GetNumber(), fNumRStripPad->GetNumber(),
             fNumRStripMid->GetNumber(), GridKey().Data(), fNumRin->GetNumber(), PadRadius());
@@ -2100,11 +2281,12 @@ void DoSharingTemplates() {
     delete gROOT->FindObject("hSumE2Reco"); delete gROOT->FindObject("hCntReco");
     delete gROOT->FindObject("hProjXReco"); delete gROOT->FindObject("gLinStrip");
     delete gROOT->FindObject("hRecMapReco");
-    TH2D *hSumE2 = new TH2D("hSumE2Reco", "", 30, 0, PP(), 30, 0, PP());
-    TH2D *hCnt   = new TH2D("hCntReco",   "", 30, 0, PP(), 30, 0, PP());
+    const int nMapBins = (int)fNumMapBins->GetNumber();
+    TH2D *hSumE2 = new TH2D("hSumE2Reco", "", nMapBins, 0, PP(), nMapBins, 0, PP());
+    TH2D *hCnt   = new TH2D("hCntReco",   "", nMapBins, 0, PP(), nMapBins, 0, PP());
     TH2D *hResMap = new TH2D("hResMapReco",
                               Form("X Resolution Map (Noise=%.1f);X True [#mum];Y True [#mum];RMS #DeltaX [#mum]", noise),
-                              30, 0, PP(), 30, 0, PP());
+                              nMapBins, 0, PP(), nMapBins, 0, PP());
 
     // global X residual histogram
     TH1D *hErrX = new TH1D("hErrXReco", Form("X Resolution (Noise=%.1f);#Delta X [#mum];Events", noise), 100, -200., 200.);
@@ -2115,10 +2297,19 @@ void DoSharingTemplates() {
 
     TH2D *hRecMap = new TH2D("hRecMapReco",
         Form("Reconstructed Position Density (Noise=%.1f);X_{reco} [#mum];Y_{reco} [#mum];Entries", noise),
-        30, 0, PP(), 30, 0, PP());
+        nMapBins, 0, PP(), nMapBins, 0, PP());
     hRecMap->SetStats(0);
 
     std::cout << ">>> Running " << nEvents << " random events..." << std::endl;
+
+    // Templates copied to a flat array once: the chi2 search below visits every
+    // template bin for every event, and TH2D::GetBinContent dominated the run time
+    const int nTX = fTemplates[0]->GetNbinsX(), nTY = fTemplates[0]->GetNbinsY();
+    std::vector<double> tflat(4 * (size_t)nTX * nTY);
+    for (int bx = 1; bx <= nTX; bx++)
+        for (int by = 1; by <= nTY; by++)
+            for (int p = 0; p < 4; p++)
+                tflat[4*((bx-1)*nTY + (by-1)) + p] = fTemplates[p]->GetBinContent(bx, by);
 
     int nSkippedReco = 0;
     for (int ev = 0; ev < nEvents; ev++) {
@@ -2165,10 +2356,11 @@ void DoSharingTemplates() {
 
         for(int bx = 1; bx <= nBinsX; bx++) {
             for(int by = 1; by <= nBinsY; by++) {
+                const double *t = &tflat[4*((bx-1)*nBinsY + (by-1))];
                 double chi2 = 0;
                 for(int p=0; p<4; p++) {
-                    double t_val = fTemplates[p]->GetBinContent(bx, by);
-                    chi2 += pow(A_noisy[p] - t_val, 2);
+                    double d = A_noisy[p] - t[p];
+                    chi2 += d*d;
                 }
                 if(chi2 < min_chi2) {
                     min_chi2 = chi2;
@@ -2335,6 +2527,7 @@ void DoSharingTemplates() {
 
 void DoResistanceMatrix() {
     SetStatus("  Computing...  ", true);
+    GetSolver(false);   // brings the type and wire maps up to date with the GUI
     std::cout << "\n>>> Computing inter-electrode resistance (2-terminal, all others floating)..." << std::endl;
 
     // Pure 2-terminal measurement: inject 1A into TR, ground only the sink pad.
