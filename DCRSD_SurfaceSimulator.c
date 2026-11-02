@@ -45,6 +45,8 @@ private:
     TGNumberEntry       *fNumRin;
     TGNumberEntry       *fNumPadRadius;
     TGNumberEntry       *fNumNPad = nullptr, *fNumMargin = nullptr;
+    TGCheckButton       *fChkEdgeOnly = nullptr;
+    bool                 fEdgeOnly = false;   // only the outer ring of pads exists (set by DoEdgeOnlyToggle)
     TGTextEntry         *fCfgFile;
     TGCheckButton       *fChkTrench    = nullptr;
     TGCheckButton       *fChkNoStruct = nullptr;
@@ -88,9 +90,12 @@ private:
     bool InArray(double u)              { return InArrayAt(u, PP()); }
     // Cache-key tag for the pad array; empty for the original 4x4, margin-0 layout
     // so existing cache files stay valid
+    // _edge: only the outer ring of pads present
     TString ArrayKey() {
-        return (fNPad == 4 && fMargin == 0) ? TString("")
-                                            : TString::Format("_N%d_m%.2f", fNPad, fMargin);
+        TString k = (fNPad == 4 && fMargin == 0) ? TString("")
+                                                 : TString::Format("_N%d_m%.2f", fNPad, fMargin);
+        if (fEdgeOnly) k += "_edge";
+        return k;
     }
 
     // Central-pixel roles (4x4: BL=6, TL=7, BR=10, TR=11)
@@ -102,6 +107,12 @@ private:
         fCentral[kBR] = PadID(b, a);  fCentral[kTR] = PadID(b, b);
     }
     int RoleOf(int id) { for (int q = 0; q < 4; q++) if (fCentral[q] == id) return q; return -1; }
+    // Pad k exists as metal + read-out (false for the removed interior pads in edge-only mode)
+    bool PadPresent(int k) {
+        if (!fEdgeOnly) return true;
+        int r = (k-1) / fNPad, c = (k-1) % fNPad;
+        return r == 0 || r == fNPad-1 || c == 0 || c == fNPad-1;
+    }
     int RoleColor(int q) { const int col[4] = { kRed, kBlue, kGreen+2, kMagenta }; return col[q]; }
     double CLo()  { return PadPos((fNPad - 1) / 2); }   // central pixel lower edge (4x4: PP)
     double CHi()  { return CLo() + PP(); }               // upper edge (4x4: 2*PP)
@@ -159,7 +170,7 @@ private:
         double R_in = fNumRin->GetNumber();
         if (R_in > 0) {
             for (int k = 1; k <= NPads(); k++)
-                if (pad_k == 0 || k == pad_k) r(PadCenterNode(k)) += 1.0 / R_in;
+                if ((pad_k == 0 || k == pad_k) && PadPresent(k)) r(PadCenterNode(k)) += 1.0 / R_in;
         } else {
             const int di[]={1,-1,0,0}, dj[]={0,0,1,-1};
             for (int i=0; i<n; i++) for (int j=0; j<n; j++) {
@@ -347,6 +358,9 @@ public:
         fNumMargin = new TGNumberEntry(hArray, fMargin, 5, -1, TGNumberFormat::kNESRealTwo, TGNumberFormat::kNEANonNegative, TGNumberFormat::kNELLimitMinMax, 0, 2);
         hArray->AddFrame(fNumMargin, arrayL);
         vCol1->AddFrame(hArray, entL);
+        fChkEdgeOnly = new TGCheckButton(vCol1, "Only edge pads (remove interior pads)");
+        vCol1->AddFrame(fChkEdgeOnly, entL);
+        fChkEdgeOnly->Connect("Toggled(Bool_t)", "RSDStripPanel", this, "DoEdgeOnlyToggle()");
         fNumNPad->Connect("ValueSet(Long_t)", "RSDStripPanel", this, "DoArrayChange()");
         fNumMargin->Connect("ValueSet(Long_t)", "RSDStripPanel", this, "DoArrayChange()");
 
@@ -500,7 +514,7 @@ public:
         vCol3->AddFrame(btnSim, btnL); btnSim->Resize(250, 40);
         btnSim->SetBackgroundColor(0xffe4b0);
 
-        TGTextButton *btnTrans = new TGTextButton(vCol3, "Inject charge and compute signals (4 central pads)");
+        TGTextButton *btnTrans = new TGTextButton(vCol3, "Inject charge and compute signals (all pads)");
         btnTrans->Connect("Clicked()", "RSDStripPanel", this, "DoTransient()");
         vCol3->AddFrame(btnTrans, btnL); btnTrans->Resize(250, 40);
         btnTrans->SetBackgroundColor(0xffe4b0);
@@ -654,6 +668,7 @@ public:
                     if (ds <= pp*0.025) is_s = true;
                     for (int c = 0; c < fNPad; c++) {
                         double dp = TMath::Hypot(x - xr, y - PadPosAt(c, pp));
+                        if (!PadPresent(PadID(r, c))) continue;   // removed pad: plain surface
                         if (dp <= pad_r) fTypeMap[idx] = PadID(r, c);
                         if (dp < min_dp) { min_dp = dp; closest_pad = PadID(r, c); }
                     }
@@ -843,14 +858,17 @@ public:
         return pi*n + pj;
     }
 
-    // Pads as filled circles: central four in their role colours, the rest gray
+    // Pads as filled circles: central four in their role colours, the rest gray;
+    // removed pads (edge-only mode) as dashed outlines
     void DrawPads(double radius) {
         for (int r = 0; r < fNPad; r++)
             for (int c = 0; c < fNPad; c++) {
                 int q = RoleOf(PadID(r, c));
                 int col = (q >= 0) ? RoleColor(q) : kGray;
                 TEllipse *el = new TEllipse(PadPos(r), PadPos(c), radius, radius);
-                el->SetFillColor(col); el->SetLineColor(col); el->Draw("SAME");
+                el->SetFillColor(col); el->SetLineColor(col);
+                if (!PadPresent(PadID(r, c))) { el->SetFillStyle(0); el->SetLineStyle(2); }
+                el->Draw("SAME");
             }
     }
 
@@ -895,6 +913,22 @@ public:
                   << " pitch: mesh " << n << "x" << n << ", central pads "
                   << fCentral[kBL] << "/" << fCentral[kTL] << "/" << fCentral[kBR] << "/" << fCentral[kTR]
                   << " (BL/TL/BR/TR)" << std::endl;
+    }
+
+    // Remove every interior pad, the 4 central ones included, keeping only the outer
+    // ring of read-out pads. Strips are unchanged; the removed positions become plain
+    // resistive surface (no metal, no R_in to GND).
+    void DoEdgeOnlyToggle() {
+        bool v = fChkEdgeOnly->IsOn();
+        if (v == fEdgeOnly) return;
+        fEdgeOnly = v;
+        fTypeMapGridKey = "(pads changed)";   // rebuild the type maps on the next GetSolver
+        InvalidateSolvers();
+        for (auto b : fDepButtons) b->SetEnabled(kFALSE);   // must recompute the matrix
+        fBtnReco->SetEnabled(kFALSE); fBtnExport->SetEnabled(kFALSE);
+        fTemplatesReady = false;
+        std::cout << ">>> " << (fEdgeOnly ? "Only the edge pads present (interior pads removed)" : "All pads present")
+                  << ": press Compute resistance matrix" << std::endl;
     }
 
     void DoTrenchToggle() {
@@ -1128,7 +1162,7 @@ public:
 
             for(int c=0; c<fNPad; c++) {
                 double dp = TMath::Hypot(x - PadPos(k), y - PadPos(c));
-                if(dp - PadRadius() <= 0) is_s = true;
+                if(dp - PadRadius() <= 0 && PadPresent(PadID(k, c))) is_s = true;
                 if(dp < min_dist_pad_center) min_dist_pad_center = dp;
             }
         }
@@ -1140,11 +1174,17 @@ public:
         return R_bulk;
     }
 
-    void CalculatePropagation(double injX, double injY, std::vector<double>& out_delays, std::vector<TGraph*>& out_paths) {
+    // Shortest "Fermat" propagation time [ns] from the injection point to each target
+    // pad, avoiding other pads and their strips. Local resistivity is evaluated once
+    // per node up front (the search used to re-evaluate it 9 times per visited node).
+    void CalculatePropagation(double injX, double injY, const std::vector<int>& targets,
+                              std::vector<double>& out_delays, std::vector<TGraph*>& out_paths) {
         double thick_um = fNumThick->GetNumber();
-        
-        for (int idx = 0; idx < 4; idx++) {   // role order: BL, TL, BR, TR
-            int targetID = fCentral[idx];
+        std::vector<double> rNode(nTot);
+        for (int i = 0; i < n; i++)
+            for (int j = 0; j < n; j++) rNode[i*n+j] = GetLocalResistance(i * Pitch(), j * Pitch());
+
+        for (int targetID : targets) {
             int targetCenter = PadCenterNode(targetID);
 
             int injI = TMath::Nint(injX/Pitch());
@@ -1176,7 +1216,7 @@ public:
 
                 int ui = u / n;
                 int uj = u % n;
-                double r_u = GetLocalResistance(ui * Pitch(), uj * Pitch());
+                double r_u = rNode[u];
 
                 for (int k = 0; k < 8; k++) {
                     int vi = ui + di[k];
@@ -1196,7 +1236,7 @@ public:
                             continue; 
                         }
                         
-                        double r_v = GetLocalResistance(vi * Pitch(), vj * Pitch());
+                        double r_v = rNode[v];
                         double r_avg = (r_u + r_v) / 2.0; 
                         
                         double local_v_factor = 0.56 * std::sqrt((r_avg / PP()*1.5) * (50.0 / thick_um));
@@ -1240,6 +1280,7 @@ public:
         if (R_in > 0) {
             // Only the representative (center) node of each pad drains via R_in
             for (int k=1; k<=NPads(); k++) {
+                if (!PadPresent(k)) continue;
                 double I = V(PadCenterNode(k)) / R_in;
                 cur[k] += I; iTot += I;
             }
@@ -1438,6 +1479,9 @@ public:
         SetStatus("  Computing...  ", true);
         GetSolver(false);  // build and cache the static matrix/solver
         for (auto btn : fDepButtons) btn->SetEnabled(kTRUE);
+        // Edge-only: everything but "Inject charge" and the transient (fDepButtons[0], [1])
+        // analyses the 4 central pads, which are removed
+        if (fEdgeOnly) for (size_t b = 2; b < fDepButtons.size(); b++) fDepButtons[b]->SetEnabled(kFALSE);
         fBtnReco->SetEnabled(kFALSE);  // requires new template computation
         fTemplatesReady = false;
 
@@ -1493,7 +1537,7 @@ void DoInjectCharge() {
     if (iTotal < 0.9)
         std::cout << ">>> WARNING: Total collected current = " << iTotal << " (expected 1.0)" << std::endl;
     double fracCentral = (iTotal > 0) ? (I_out[fCentral[kBL]]+I_out[fCentral[kTL]]+I_out[fCentral[kBR]]+I_out[fCentral[kTR]])/iTotal : 0;
-    printf(">>> Central 4 pads fraction: %.1f %%\n", fracCentral * 100.0);
+    if (!fEdgeOnly) printf(">>> Central 4 pads fraction: %.1f %%\n", fracCentral * 100.0);
     
     // Pad colors: BL=red, TL=blue, BR=green+2, TR=magenta (4x4: 6, 7, 10, 11), others=gray
     c->cd(1); hRes->Draw("COLZ"); DrawPads(PP()*0.05);
@@ -1518,6 +1562,14 @@ void DoInjectCharge() {
 
 
 
+    // Transient response of every pad to a short current pulse at (X, Y).
+    // Read-out as in CollectCurrents: R_in>0 -> I_k = V(centre_k)/R_in, the current
+    // through the input impedance; R_in=0 -> pads held at 0 V, current = flow in from
+    // the surface. (The old V(surface)*g sum assumed V_pad = 0 also for R_in>0, which
+    // overstated the currents ~40x by a pad-dependent factor.)
+    // Each waveform is shifted by its pad's Fermat propagation delay, as before.
+    // Outputs: c1 oscilloscope (4 central pads), c7 all pads in array layout, and
+    // waveforms/*.txt with every pad's current per time step.
     void DoTransient() {
         SetStatus("  Computing...  ", true);
         double thick_um = fNumThick->GetNumber();
@@ -1527,96 +1579,175 @@ void DoInjectCharge() {
         double dt = 20e-12; int nSteps = (int)(duration / dt);
         
         TDecompSparse *solver = GetSolver(true, dt, C_node);
-        TVectorD V(nTot); V.Zero(); TVectorD B(nTot); 
         double injX = fNumX->GetNumber(); double injY = fNumY->GetNumber();
         int injI = std::max(0, std::min(n-1, TMath::Nint(injX/Pitch())));
         int injJ = std::max(0, std::min(n-1, TMath::Nint(injY/Pitch())));
         int injIdx = injI*n + injJ;
+        const int nP = NPads();
+        const double R_in = fNumRin->GetNumber();
 
-        TGraph *gP6  = new TGraph(); 
-        TGraph *gP7  = new TGraph(); 
-        TGraph *gP10 = new TGraph(); 
-        TGraph *gP11 = new TGraph();
-        TGraph *gInput = new TGraph(); 
-
-        gP6->SetLineColor(kRed); gP6->SetLineWidth(2);
-        gP7->SetLineColor(kBlue); gP7->SetLineWidth(2);
-        gP10->SetLineColor(kGreen+2); gP10->SetLineWidth(2);
-        gP11->SetLineColor(kMagenta); gP11->SetLineWidth(2);
-        gInput->SetLineColor(kBlack); gInput->SetLineStyle(2); gInput->SetLineWidth(2);
-
-        std::vector<double> delays;
+        // Fermat delay of every present pad (unreachable or removed -> no shift)
+        std::vector<int> allPads, present;
+        for (int k = 1; k <= nP; k++) { allPads.push_back(k); if (PadPresent(k)) present.push_back(k); }
+        std::vector<double> dl;
         std::vector<TGraph*> paths; 
-        CalculatePropagation(injX, injY, delays, paths);
+        CalculatePropagation(injX, injY, present, dl, paths);
         for(auto p : paths) delete p; 
-        
-        double delay6  = delays[0];
-        double delay7  = delays[1];
-        double delay10 = delays[2];
-        double delay11 = delays[3];
+        std::vector<double> delays(nP+1, 1e15);
+        for (size_t i = 0; i < present.size(); i++) delays[present[i]] = dl[i];
+        auto delayOf = [&](int id) { double d = delays[id]; return (d < 1e14) ? d : 0.0; };
 
-        double maxSig = 0;
-
-        for (int t=0; t<nSteps; t++) {
-            for(int i=0; i<nTot; i++) B(i) = (C_node/dt) * V(i);
-            double inputVal = 0; if (t > 5 && t <= 10) { inputVal = 10.0; B(injIdx) += inputVal; }
-            bool ok; V = solver->Solve(B, ok); 
-
-            double iq[4] = {0, 0, 0, 0};   // BL, TL, BR, TR
+        // Read-out nodes / edges
+        std::vector<int> centre(nP+1, 0);
+        for (int k = 1; k <= nP; k++) centre[k] = PadCenterNode(k);
+        struct PadEdge { int node, pad; double g; };
+        std::vector<PadEdge> padEdges;   // R_in=0 only: surface node -> pad conductances
+        if (R_in <= 0) {
             const int di[]={1,-1,0,0}, dj[]={0,0,1,-1};
-            for (int i=0; i<n; i++) { for (int j=0; j<n; j++) {
+            for (int i=0; i<n; i++) for (int j=0; j<n; j++) {
                 int idx = i*n+j;
-                if (fTypeMap[idx] == 0) {
-                    for(int k=0; k<4; k++){
-                        int ni=i+di[k], nj=j+dj[k];
-                        if(ni>=0 && ni<n && nj>=0 && nj<n && fTypeMap[ni*n+nj]>0) {
-                            double cond = GetEdgeConductance(i, j, di[k], dj[k]);
-                            double cur  = V(idx) * cond;
-                            int id = fTypeMap[ni*n+nj];
-                            int q = RoleOf(id); if (q >= 0) iq[q] += cur;
-                        }
-                    }
+                if (fTypeMap[idx] != 0) continue;
+                for (int k=0; k<4; k++) {
+                    int ni=i+di[k], nj=j+dj[k];
+                    if (ni>=0 && ni<n && nj>=0 && nj<n && fTypeMap[ni*n+nj]>0)
+                        padEdges.push_back({idx, fTypeMap[ni*n+nj], GetEdgeConductance(i, j, di[k], dj[k])});
                 }
-            }}
-            double i6 = iq[kBL], i7 = iq[kTL], i10 = iq[kBR], i11 = iq[kTR];
-            
-            double time_ns = t * dt * 1e9;
-            
-            if (delay6 < 1e14) gP6->SetPoint(t, time_ns + delay6, i6); else gP6->SetPoint(t, time_ns, i6);
-            if (delay7 < 1e14) gP7->SetPoint(t, time_ns + delay7, i7); else gP7->SetPoint(t, time_ns, i7);
-            if (delay10 < 1e14) gP10->SetPoint(t, time_ns + delay10, i10); else gP10->SetPoint(t, time_ns, i10);
-            if (delay11 < 1e14) gP11->SetPoint(t, time_ns + delay11, i11); else gP11->SetPoint(t, time_ns, i11);
-            
-            maxSig = std::max({maxSig, i6, i7, i10, i11});
-            gInput->SetPoint(t, time_ns, inputVal);
-            if (t % 100 == 0) gSystem->ProcessEvents(); 
+            }
         }
 
-        double maxIn = TMath::MaxElement(gInput->GetN(), gInput->GetY());
-        if (maxIn > 0 && maxSig > 0) { double scaleFactor = maxSig / maxIn; for (int k=0; k<gInput->GetN(); k++) gInput->GetY()[k] *= scaleFactor; }
+        // Time stepping (implicit Euler): (C/dt + G) V_t = C/dt V_{t-1} + I_inj, solved in place
+        std::vector<std::vector<double>> wave(nP+1, std::vector<double>(nSteps, 0.0));
+        std::vector<double> input(nSteps, 0.0);
+        TVectorD V(nTot); V.Zero();
+        for (int t=0; t<nSteps; t++) {
+            V *= C_node/dt;
+            if (t > 5 && t <= 10) { input[t] = 10.0; V(injIdx) += input[t]; }
+            solver->Solve(V);
+            if (R_in > 0) for (int k : present)       wave[k][t] = V(centre[k]) / R_in;
+            else          for (auto &e : padEdges)    wave[e.pad][t] += V(e.node) * e.g;
+            if (t % 20 == 0) gSystem->ProcessEvents(); 
+        }
+        auto tns = [&](int t) { return t * dt * 1e9; };
+
+        // --- c1: oscilloscope, 4 central pads (edge-only: the 4 pads collecting the most charge) ---
+        int scope[4] = { fCentral[kBL], fCentral[kTL], fCentral[kBR], fCentral[kTR] };
+        if (fEdgeOnly) {
+            std::vector<double> qAbs(nP+1, 0.0);
+            for (int k = 1; k <= nP; k++) for (int t = 0; t < nSteps; t++) qAbs[k] += std::abs(wave[k][t]);
+            std::vector<int> byQ(present);
+            std::sort(byQ.begin(), byQ.end(), [&](int a, int b) { return qAbs[a] > qAbs[b]; });
+            for (int q = 0; q < 4 && q < (int)byQ.size(); q++) scope[q] = byQ[q];
+        }
+        TGraph *gq[4];
+        double maxSig = 0, maxDelay4 = 0;
+        for (int q = 0; q < 4; q++) {
+            int id = scope[q];
+            gq[q] = new TGraph(nSteps);
+            gq[q]->SetLineColor(RoleColor(q)); gq[q]->SetLineWidth(2);
+            for (int t = 0; t < nSteps; t++) {
+                gq[q]->SetPoint(t, tns(t) + delayOf(id), wave[id][t]);
+                maxSig = std::max(maxSig, wave[id][t]);
+            }
+            maxDelay4 = std::max(maxDelay4, delayOf(id));
+        }
+        TGraph *gInput = new TGraph(nSteps);
+        gInput->SetLineColor(kBlack); gInput->SetLineStyle(2); gInput->SetLineWidth(2);
+        double maxIn = *std::max_element(input.begin(), input.end());
+        for (int t = 0; t < nSteps; t++)
+            gInput->SetPoint(t, tns(t), (maxIn > 0 && maxSig > 0) ? input[t] * maxSig / maxIn : input[t]);
         
         TCanvas *cScope = (TCanvas*)gROOT->GetListOfCanvases()->FindObject("cScope");
         if (!cScope) cScope = new TCanvas("cScope", "c1 - RSD Oscilloscope", 480, 360);
         cScope->cd(); cScope->Clear(); gPad->SetGrid();
-        
-        double valid_delay6 = (delay6 < 1e14) ? delay6 : 0;
-        double valid_delay7 = (delay7 < 1e14) ? delay7 : 0;
-        double valid_delay10 = (delay10 < 1e14) ? delay10 : 0;
-        double valid_delay11 = (delay11 < 1e14) ? delay11 : 0;
-
-        double max_t = (nSteps * dt * 1e9) + std::max({valid_delay6, valid_delay7, valid_delay10, valid_delay11});
+        double max_t = (nSteps * dt * 1e9) + maxDelay4;
         TH1F *hFrame = cScope->DrawFrame(0, 0, max_t, (maxSig>0)?maxSig*1.1:1.0);
         hFrame->SetTitle("Transient with Fermat Diffraction Delay;Time [ns];Current [a.u.]");
-
-        gP6->Draw("L SAME"); gP7->Draw("L SAME"); gP10->Draw("L SAME"); gP11->Draw("L SAME"); gInput->Draw("L SAME");
-        
+        for (int q = 0; q < 4; q++) gq[q]->Draw("L SAME");
+        gInput->Draw("L SAME");
         TLegend *leg = new TLegend(0.75, 0.6, 0.95, 0.9);
         leg->AddEntry(gInput, "Input Pulse (T0)", "l"); 
-        leg->AddEntry(gP6,  Form("Pad %d", fCentral[kBL]), "l");
-        leg->AddEntry(gP7,  Form("Pad %d", fCentral[kTL]), "l");
-        leg->AddEntry(gP10, Form("Pad %d", fCentral[kBR]), "l");
-        leg->AddEntry(gP11, Form("Pad %d", fCentral[kTR]), "l");
+        for (int q = 0; q < 4; q++) leg->AddEntry(gq[q], Form("Pad %d", scope[q]), "l");
         leg->Draw(); cScope->Update(); cScope->RaiseWindow();
+
+        // --- c7: every pad, arranged like the pad array (top row = highest y), common scale ---
+        double yLo = 0, yHi = 0, tMax = 0, peakMax = 0;
+        std::vector<double> peak(nP+1, 0.0), qFrac(nP+1, 0.0);
+        double qIn = 0; for (double v : input) qIn += v * dt;
+        for (int k = 1; k <= nP; k++) {
+            for (int t = 0; t < nSteps; t++) {
+                yLo = std::min(yLo, wave[k][t]); yHi = std::max(yHi, wave[k][t]);
+                if (std::abs(wave[k][t]) > std::abs(peak[k])) peak[k] = wave[k][t];
+                qFrac[k] += wave[k][t] * dt / qIn;
+            }
+            peakMax = std::max(peakMax, std::abs(peak[k]));
+            tMax = std::max(tMax, tns(nSteps) + delayOf(k));
+        }
+        double pad_y = 0.08 * (yHi - yLo);
+        TCanvas *cWave = (TCanvas*)gROOT->GetListOfCanvases()->FindObject("cWave");
+        if (!cWave) cWave = new TCanvas("cWave", "c7 - Waveforms, all pads (array layout)", 900, 900);
+        cWave->cd(); cWave->Clear(); cWave->Divide(fNPad, fNPad, 0.001, 0.001);
+        for (int r = 0; r < fNPad; r++)
+            for (int c = 0; c < fNPad; c++) {
+                int id = PadID(r, c), q = -1;
+                for (int s = 0; s < 4; s++) if (scope[s] == id) q = s;   // c1 pads keep their c1 colour
+                cWave->cd((fNPad-1-c)*fNPad + r + 1);
+                gPad->SetMargin(0.14, 0.03, 0.12, 0.03); gPad->SetGrid();
+                TH1F *fr = gPad->DrawFrame(0, yLo - pad_y, tMax, yHi + pad_y);
+                fr->GetXaxis()->SetLabelSize(0.07); fr->GetYaxis()->SetLabelSize(0.07);
+                fr->GetXaxis()->SetNdivisions(504); fr->GetYaxis()->SetNdivisions(504);
+                TGraph *g = new TGraph(nSteps);
+                for (int t = 0; t < nSteps; t++) g->SetPoint(t, tns(t) + delayOf(id), wave[id][t]);
+                g->SetLineColor(q >= 0 ? RoleColor(q) : kBlack); g->SetLineWidth(q >= 0 ? 2 : 1);
+                g->Draw("L");
+                TLatex lt; lt.SetNDC(); lt.SetTextSize(0.10);
+                if (PadPresent(id))
+                    lt.DrawLatex(0.50, 0.85, Form("P%d  %.0f%%", id, peakMax > 0 ? 100.0*std::abs(peak[id])/peakMax : 0.0));
+                else
+                    lt.DrawLatex(0.40, 0.85, Form("P%d removed", id));
+            }
+        cWave->cd(); cWave->Update(); cWave->RaiseWindow();
+
+        // --- Terminal summary ---
+        double qSum = 0; for (int k = 1; k <= nP; k++) qSum += qFrac[k];
+        printf(">>> Transient at (%.1f, %.1f) um, %d steps of %.0f ps. Collected charge fraction per pad in the window "
+               "(peak, delay):\n", injX, injY, nSteps, dt*1e12);
+        std::vector<int> order(allPads);
+        std::sort(order.begin(), order.end(), [&](int a, int b) { return qFrac[a] > qFrac[b]; });
+        for (int i = 0; i < std::min(nP, 8); i++) {
+            int k = order[i];
+            printf("    pad %3d  Q %6.2f %%   peak %.4g   delay %.3f ns\n", k, 100*qFrac[k], peak[k], delayOf(k));
+        }
+        printf("    all pads Q %.2f %%  (rest still on the surface at the end of the window%s)\n",
+               100*qSum, (GridEnabled() || ElbowEnabled()) ? " or drained through R_end" : "");
+
+        // --- waveforms/*.txt: every pad, undelayed time axis + per-pad delays ---
+        gSystem->mkdir("waveforms", kTRUE);
+        TString structKey = TrenchEnabled() ? TString("tr1") : (GridKey().IsNull() ? TString("strips") : GridKey());
+        TString fname = TString::Format("waveforms/wave_PP%.0f_N%d_m%.2f%s_%s_Rin%.2f_x%.1f_y%.1f.txt",
+                                        PP(), fNPad, fMargin, fEdgeOnly ? "_edge" : "", structKey.Data(), R_in, injX, injY);
+        std::ofstream fw(fname.Data());
+        fw << "# DCRSD transient waveforms, one column per pad (current [a.u.], read-out "
+           << (R_in > 0 ? "V(pad)/R_in" : "flow into grounded pad") << ")\n";
+        fw << "# PP=" << PP() << " NPad=" << fNPad << " Margin=" << fMargin << " Rsheet=" << fNumRsheet->GetNumber()
+           << " RStripPad=" << fNumRStripPad->GetNumber() << " RStripMid=" << fNumRStripMid->GetNumber()
+           << " StripGap=" << fNumStripGap->GetNumber() << " StripGapPad=" << fNumStripGapPad->GetNumber()
+           << " Structure=" << structKey << " Rin=" << R_in << " PadRadius=" << PadRadius()
+           << " Thick=" << thick_um << "\n";
+        fw << "# injection x=" << injX << " y=" << injY << " um; input 10 a.u. for steps 6-10; dt=" << dt*1e12 << " ps\n";
+        fw << "# central pads BL TL BR TR = " << fCentral[kBL] << " " << fCentral[kTL] << " " << fCentral[kBR] << " " << fCentral[kTR] << "\n";
+        if (fEdgeOnly) fw << "# only the edge pads present; interior-pad columns are removed pads (always 0)\n";
+        fw << "# delay_ns (Fermat delay; add to t_ns for the waveforms as plotted):";
+        for (int k = 1; k <= nP; k++) fw << " " << delayOf(k);
+        fw << "\n# t_ns input";
+        for (int k = 1; k <= nP; k++) fw << " I_" << k;
+        fw << "\n";
+        for (int t = 0; t < nSteps; t++) {
+            fw << tns(t) << " " << input[t];
+            for (int k = 1; k <= nP; k++) fw << " " << wave[k][t];
+            fw << "\n";
+        }
+        fw.close();
+        std::cout << ">>> Waveforms written to " << fname << std::endl;
         SetStatus("  Ready  ", false);
     }
 
@@ -2069,6 +2200,7 @@ void DoSharingTemplates() {
     double npad = 4, marg = 0;
     extract("_N", npad);
     extract("_m", marg);
+    bool edgeOnly = fn.find("_edge") != std::string::npos;
 
     fNumPixelPitch->SetNumber((int)pp);
     fNumRsheet->SetNumber(rsh);
@@ -2095,6 +2227,8 @@ void DoSharingTemplates() {
     fNumNPad->SetNumber((int)npad);
     fNumMargin->SetNumber(marg);
     DoArrayChange();
+    fChkEdgeOnly->SetState(edgeOnly ? kButtonDown : kButtonUp);
+    DoEdgeOnlyToggle();
     UpdatePosLimits();
     DoTrenchToggle();
     DoGridToggle();
@@ -2125,6 +2259,7 @@ void DoSharingTemplates() {
     f << "PP="          << fNumPixelPitch->GetNumber()  << "\n";
     f << "NPad="        << fNPad                        << "\n";
     f << "Margin="      << fMargin                      << "\n";
+    f << "EdgeOnly="    << (fEdgeOnly ? 1 : 0)          << "\n";
     f << "Rsheet="      << fNumRsheet->GetNumber()      << "\n";
     f << "RStripPad="   << fNumRStripPad->GetNumber()   << "\n";
     f << "RStripMid="   << fNumRStripMid->GetNumber()   << "\n";
@@ -2166,6 +2301,7 @@ void DoSharingTemplates() {
         if      (name == "PP")          fNumPixelPitch->SetNumber((int)val);
         else if (name == "NPad")        fNumNPad->SetNumber((int)val);
         else if (name == "Margin")      fNumMargin->SetNumber(val);
+        else if (name == "EdgeOnly")    fChkEdgeOnly->SetState(val ? kButtonDown : kButtonUp);
         else if (name == "Rsheet")      fNumRsheet->SetNumber(val);
         else if (name == "RStripPad")   fNumRStripPad->SetNumber(val);
         else if (name == "RStripMid")   fNumRStripMid->SetNumber(val);
@@ -2202,6 +2338,7 @@ void DoSharingTemplates() {
         fChkElbow->SetState(kButtonUp);
     }
     DoArrayChange();   // no-op if the pad array is unchanged
+    DoEdgeOnlyToggle();   // no-op if unchanged
     UpdatePosLimits();
     DoTrenchToggle();  // sync enabled/disabled state of strip fields
     DoGridToggle();
